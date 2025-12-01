@@ -1,4 +1,5 @@
 from structs import CoreData
+from utils import hash_pii, fetch_secret_key
 from django.conf import settings
 import asyncio
 import json
@@ -66,6 +67,19 @@ class CerberusMiddleware:
     def __init__(self, get_response):
         self.get_response = get_response
         self.config = getattr(settings, 'CERBERUS_CONFIG', {})
+
+        # Auto-fetch secret_key from backend if not configured locally
+        if 'secret_key' not in self.config and 'backend_url' in self.config:
+            secret_key = fetch_secret_key(
+                self.config['backend_url'],
+                self.config.get('token', '')
+            )
+            if secret_key:
+                self.config['secret_key'] = secret_key
+                print(f"Successfully fetched secret key from {self.config['backend_url']}")
+            else:
+                print("Warning: Failed to fetch secret key. PII will not be hashed.")
+
         ensure_queue_task()
 
     def __call__(self, request):
@@ -82,9 +96,14 @@ class CerberusMiddleware:
                 metrics = response.data.pop('_cerberus_metrics')
         
         # After the view has executed, create and store the CoreData
+        # Hash PII (source IP) if secret_key is configured
+        source_ip = request.META.get('REMOTE_ADDR')
+        if 'secret_key' in self.config:
+            source_ip = hash_pii(source_ip, self.config['secret_key'])
+
         d = CoreData(
             self.config.token,
-            request.META.get('REMOTE_ADDR'),
+            source_ip,
             request.path,
             request.scheme == 'https',
             request.method,
