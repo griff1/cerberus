@@ -1,18 +1,41 @@
-from structs import CoreData
-from utils import hash_pii, fetch_secret_key
+from .structs import CoreData
+from .utils import hash_pii, fetch_secret_key
 from django.conf import settings
 import asyncio
 import json
 
 # Use an asyncio.Queue for thread-safe, async producer-consumer pattern
-buffer_queue = asyncio.Queue()
+# Lazy initialization to avoid creating Queue before event loop exists
+buffer_queue = None
+
+def get_buffer_queue():
+    """Get or create the buffer queue lazily."""
+    global buffer_queue
+    if buffer_queue is None:
+        try:
+            buffer_queue = asyncio.Queue()
+        except RuntimeError:
+            # If there's no event loop yet, we'll try again later
+            pass
+    return buffer_queue
 
 class AsyncTCPClient:
     def __init__(self, host, port):
         self.host = host
         self.port = port
         self.writer = None
-        self.lock = asyncio.Lock()
+        self._lock = None
+
+    @property
+    def lock(self):
+        """Lazy initialization of the lock to avoid creating it before event loop exists."""
+        if self._lock is None:
+            try:
+                self._lock = asyncio.Lock()
+            except RuntimeError:
+                # If there's no event loop yet, return a simple object that will be replaced later
+                pass
+        return self._lock
 
     async def connect(self):
         try:
@@ -42,12 +65,16 @@ TCP_CLIENT = AsyncTCPClient('BACKEND_HOST', 12345)
 # Background task to process the queue
 async def process_queue():
     while True:
-        data = await buffer_queue.get()
+        queue = get_buffer_queue()
+        if queue is None:
+            await asyncio.sleep(0.1)  # Wait for queue to be created
+            continue
+        data = await queue.get()
         try:
             await TCP_CLIENT.send(json.dumps(data.__dict__))
         except Exception as e:
             print(f"Failed to send data from queue: {e}")
-        buffer_queue.task_done()
+        queue.task_done()
 
 # Ensure the background task is started only once
 queue_task_started = False
@@ -110,15 +137,17 @@ class CerberusMiddleware:
             custom_data=metrics
         )
         # Put the CoreData into the async queue
-        try:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                asyncio.create_task(buffer_queue.put(d))
-            else:
-                loop.run_until_complete(buffer_queue.put(d))
-        except RuntimeError:
-            # If no event loop is running, fallback to synchronous put (should not happen in ASGI)
-            asyncio.run(buffer_queue.put(d))
+        queue = get_buffer_queue()
+        if queue is not None:
+            try:
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    asyncio.create_task(queue.put(d))
+                else:
+                    loop.run_until_complete(queue.put(d))
+            except RuntimeError:
+                # If no event loop is running, fallback to synchronous put (should not happen in ASGI)
+                asyncio.run(queue.put(d))
 
         return response
     
