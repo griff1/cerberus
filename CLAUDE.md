@@ -17,10 +17,10 @@ Cerberus is a Django middleware package for collecting and streaming HTTP reques
 4. `AsyncTCPClient` maintains persistent TCP connection and sends JSON-encoded data
 
 **Key Files:**
-- `src/cerberus-django/structs.py`: Defines `CoreData` dataclass for metric structure
-- `src/cerberus-django/middleware.py`: Main middleware implementation with async queue processing
-- `src/cerberus-django/utils.py`: PII hashing utilities using HMAC-SHA256
-- `src/cerberus-django/__init__.py`: Package initialization (currently empty)
+- `src/cerberus_django/structs.py`: Defines `CoreData` dataclass for metric structure
+- `src/cerberus_django/middleware.py`: Main middleware implementation with async queue processing
+- `src/cerberus_django/utils.py`: PII hashing utilities using HMAC-SHA256
+- `src/cerberus_django/__init__.py`: Package initialization and exports
 
 ### Middleware Configuration
 
@@ -78,21 +78,18 @@ The middleware automatically extracts and removes this field from responses (mid
 
 **Installation in Django Project:**
 
-*Note: The directory name `cerberus-django` contains a hyphen, which is not valid for Python module names. You have two options:*
+1. Add the `cerberus/src` directory to your Python path in your Django project
+2. Add to Django's `MIDDLEWARE`: `'cerberus_django.CerberusMiddleware'`
+3. Configure `CERBERUS_CONFIG` dictionary in settings (see Middleware Configuration section)
+4. **Important**: Edit middleware.py to configure TCP backend host/port before deployment
 
-**Option A - Rename and install as package (recommended):**
-1. Rename `src/cerberus-django` to `src/cerberus_django` (replace hyphen with underscore)
-2. Update imports to use `cerberus_django` in your Django settings
-3. Add to Django's `MIDDLEWARE`: `'cerberus_django.CerberusMiddleware'`
-4. Configure `CERBERUS_CONFIG` dictionary in settings (see Middleware Configuration section)
-5. **Important**: Edit middleware.py:40 to configure TCP backend host/port before deployment
-
-**Option B - Add directory to Python path:**
-1. Keep directory name as `cerberus-django` but note you cannot import it normally
-2. Copy the directory contents directly into your Django app or create a symlink
-3. Reference in `MIDDLEWARE` based on where you placed the files
-4. Configure `CERBERUS_CONFIG` dictionary in settings (see Middleware Configuration section)
-5. **Important**: Edit middleware.py:40 to configure TCP backend host/port before deployment
+**Example - Adding to Python path:**
+```python
+# In your Django settings.py or manage.py
+import sys
+import os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'cerberus', 'src'))
+```
 
 **Dependencies:**
 - Django framework (any version with middleware support)
