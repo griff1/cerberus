@@ -1,3 +1,17 @@
+"""
+Cerberus Django Middleware
+
+Captures HTTP request metrics and sends them asynchronously to a backend
+analytics server via WebSocket.
+
+This middleware is designed to work in both WSGI (synchronous) and ASGI
+(asynchronous) Django deployments without requiring an event loop at import time.
+
+Architecture:
+- Middleware (sync): Captures request data and puts it in a thread-safe queue
+- Background thread: Runs its own event loop to process queue and send via WebSocket
+"""
+
 from .structs import CoreData
 from .utils import hash_pii, fetch_secret_key
 from django.conf import settings
@@ -5,11 +19,9 @@ import asyncio
 import json
 import os
 import logging
-import websockets
 import threading
 import queue as thread_queue
-from websocket import create_connection
-import time
+import websockets
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -17,46 +29,42 @@ logger = logging.getLogger(__name__)
 # Enable debug logging via environment variable
 DEBUG_ENABLED = os.getenv('CERBERUS_DEBUG', 'false').lower() in ('true', '1', 'yes')
 
-# Use an asyncio.Queue for thread-safe, async producer-consumer pattern
-# Lazy initialization to avoid creating Queue before event loop exists
-buffer_queue = None
+# Thread-safe queue for events (no event loop required at import time)
+event_queue = thread_queue.Queue()
 
-def get_buffer_queue():
-    """Get or create the buffer queue lazily."""
-    global buffer_queue
-    if buffer_queue is None:
-        try:
-            buffer_queue = asyncio.Queue()
-        except RuntimeError:
-            # If there's no event loop yet, we'll try again later
-            pass
-    return buffer_queue
+# Background thread management
+_background_thread = None
+_thread_lock = threading.Lock()
+
 
 class AsyncWebSocketClient:
+    """WebSocket client for sending events to the backend.
+
+    This client is used within the background thread's event loop,
+    so it can safely use asyncio primitives.
+    """
+
     def __init__(self, ws_url, api_key, client_id):
         self.ws_url = ws_url
         self.api_key = api_key
         self.client_id = client_id
         self.websocket = None
-        self._lock = None
+        self._async_lock = None  # Created lazily within event loop context
 
-    @property
-    def lock(self):
-        """Lazy initialization of the lock to avoid creating it before event loop exists."""
-        if self._lock is None:
-            try:
-                self._lock = asyncio.Lock()
-            except RuntimeError:
-                pass
-        return self._lock
+    async def _get_lock(self):
+        """Get or create async lock within the event loop context."""
+        if self._async_lock is None:
+            self._async_lock = asyncio.Lock()
+        return self._async_lock
 
     async def connect(self):
+        """Establish WebSocket connection to the backend."""
         try:
             if DEBUG_ENABLED:
                 logger.info(f"[Cerberus] Connecting to WebSocket: {self.ws_url}")
             self.websocket = await websockets.connect(self.ws_url)
             if DEBUG_ENABLED:
-                logger.info(f"[Cerberus] WebSocket connected successfully")
+                logger.info("[Cerberus] WebSocket connected successfully")
         except Exception as e:
             self.websocket = None
             logger.error(f"[Cerberus] Failed to connect to WebSocket: {e}")
@@ -67,8 +75,10 @@ class AsyncWebSocketClient:
         Args:
             event_data: CoreData object to send
         """
-        async with self.lock:
-            if self.websocket is None or self.websocket.closed:
+        lock = await self._get_lock()
+        async with lock:
+            # Connect if not already connected
+            if self.websocket is None:
                 await self.connect()
 
             if self.websocket:
@@ -100,79 +110,144 @@ class AsyncWebSocketClient:
 
                 except asyncio.TimeoutError:
                     logger.warning("[Cerberus] Timeout waiting for backend response")
+                except websockets.exceptions.ConnectionClosed:
+                    logger.warning("[Cerberus] WebSocket connection closed, will reconnect on next send")
+                    self.websocket = None
                 except Exception as e:
                     logger.error(f"[Cerberus] Error sending data: {e}")
                     if self.websocket:
-                        await self.websocket.close()
+                        try:
+                            await self.websocket.close()
+                        except Exception:
+                            pass
                     self.websocket = None
 
-# WebSocket client will be initialized in middleware __init__
+
+# WebSocket client - initialized in middleware __init__, used by background thread
 WS_CLIENT = None
 
-# Background task to process the queue
-async def process_queue():
-    print("[Cerberus] Background process_queue task STARTED")
+
+def _queue_get_with_timeout():
+    """Get an item from the queue with a 1-second timeout.
+
+    This is a helper function for run_in_executor since we need to pass
+    the timeout parameter.
+
+    Returns:
+        CoreData object or raises queue.Empty
+    """
+    return event_queue.get(block=True, timeout=1.0)
+
+
+async def _process_queue_async():
+    """Async coroutine that processes events from the thread-safe queue.
+
+    Runs continuously in the background thread's event loop.
+    """
+    global WS_CLIENT
+
+    if DEBUG_ENABLED:
+        logger.info("[Cerberus] Background queue processor started")
+
+    loop = asyncio.get_event_loop()
+
     while True:
-        queue = get_buffer_queue()
-        if queue is None:
-            print("[Cerberus] Queue is None, waiting...")
-            await asyncio.sleep(0.1)  # Wait for queue to be created
+        try:
+            # Use run_in_executor to get from sync queue without blocking event loop
+            data = await loop.run_in_executor(None, _queue_get_with_timeout)
+        except thread_queue.Empty:
+            # No events available, continue waiting
+            continue
+        except Exception as e:
+            logger.error(f"[Cerberus] Error getting from queue: {e}")
             continue
 
-        print(f"[Cerberus] Waiting for item from queue (qsize: {queue.qsize()})...")
-        data = await queue.get()
-        print(f"[Cerberus] Got event from queue: {data.endpoint}")
+        # Check for shutdown signal (None means stop)
+        if data is None:
+            if DEBUG_ENABLED:
+                logger.info("[Cerberus] Received shutdown signal, stopping processor")
+            break
 
         try:
             if WS_CLIENT:
-                print(f"[Cerberus] Processing event for endpoint: {data.endpoint}")
                 if DEBUG_ENABLED:
-                    logger.info(f"[Cerberus] Processing queued event for endpoint: {data.endpoint}")
+                    logger.info(f"[Cerberus] Processing event for endpoint: {data.endpoint}")
                 await WS_CLIENT.send(data)
-                print(f"[Cerberus] Event sent successfully")
             else:
-                print("[Cerberus] WARNING: WebSocket client not initialized, skipping event")
                 logger.warning("[Cerberus] WebSocket client not initialized, skipping event")
         except Exception as e:
-            print(f"[Cerberus] ERROR sending data: {e}")
-            logger.error(f"[Cerberus] Failed to send data from queue: {e}")
-            import traceback
-            traceback.print_exc()
-        queue.task_done()
+            logger.error(f"[Cerberus] Failed to send event: {e}")
+        finally:
+            event_queue.task_done()
 
-# Ensure the background task is started only once
-queue_task_started = False
 
-def ensure_queue_task():
-    global queue_task_started
-    print(f"[Cerberus] ensure_queue_task called, queue_task_started: {queue_task_started}")
+def _run_event_loop_in_thread():
+    """Run the async event processing loop in a dedicated thread.
 
-    if not queue_task_started:
-        try:
-            loop = asyncio.get_event_loop()
-            print(f"[Cerberus] Got event loop: {loop}")
-            task = loop.create_task(process_queue())
-            print(f"[Cerberus] Started background queue processing task: {task}")
-            queue_task_started = True
-        except RuntimeError as e:
-            # If no event loop is running, this will be handled later
-            print(f"[Cerberus] RuntimeError starting queue task: {e}")
-            pass
-    else:
-        print(f"[Cerberus] Background task already started")
+    Creates its own event loop, independent of any Django event loop.
+    """
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    if DEBUG_ENABLED:
+        logger.info("[Cerberus] Background thread started with new event loop")
+
+    try:
+        loop.run_until_complete(_process_queue_async())
+    except Exception as e:
+        logger.error(f"[Cerberus] Background event loop error: {e}")
+    finally:
+        loop.close()
+        if DEBUG_ENABLED:
+            logger.info("[Cerberus] Background thread event loop closed")
+
+
+def ensure_background_thread():
+    """Start the background processing thread if not already running.
+
+    Thread-safe: Uses a lock to prevent race conditions during startup.
+    The thread is a daemon thread, so it will automatically stop when
+    the main process exits.
+    """
+    global _background_thread
+
+    with _thread_lock:
+        if _background_thread is not None and _background_thread.is_alive():
+            return
+
+        _background_thread = threading.Thread(
+            target=_run_event_loop_in_thread,
+            name="cerberus-event-sender",
+            daemon=True  # Auto-shutdown when main process exits
+        )
+        _background_thread.start()
+
+        if DEBUG_ENABLED:
+            logger.info("[Cerberus] Started background event sender thread")
+
 
 class CerberusMiddleware:
+    """Django middleware for capturing and sending HTTP request metrics.
+
+    Compatible with both WSGI and ASGI Django deployments.
+
+    Configuration via CERBERUS_CONFIG in Django settings:
+        - token: API key for authentication
+        - client_id: Client identifier
+        - ws_url: WebSocket URL for event_ingest backend
+        - backend_url: HTTP URL for fetching secret key (optional)
+        - secret_key: HMAC key for PII hashing (optional, auto-fetched if backend_url set)
+    """
+
     def __init__(self, get_response):
         global WS_CLIENT
 
         self.get_response = get_response
         self.config = getattr(settings, 'CERBERUS_CONFIG', {})
 
-        print("=" * 60)
-        print("[Cerberus] Middleware initializing...")
-        print(f"[Cerberus] Config: {list(self.config.keys())}")
-        print(f"[Cerberus] DEBUG_ENABLED: {DEBUG_ENABLED}")
-        print("=" * 60)
+        if DEBUG_ENABLED:
+            logger.info("[Cerberus] Middleware initializing...")
+            logger.info(f"[Cerberus] Config keys: {list(self.config.keys())}")
 
         # Auto-fetch secret_key from backend if not configured locally
         if 'secret_key' not in self.config and 'backend_url' in self.config:
@@ -200,29 +275,34 @@ class CerberusMiddleware:
         else:
             logger.warning("[Cerberus] WebSocket client not initialized. Missing ws_url, token, or client_id in CERBERUS_CONFIG")
 
-        ensure_queue_task()
+        # Start background thread for processing events
+        ensure_background_thread()
 
     def __call__(self, request):
-        print(f"[Cerberus] Processing request: {request.method} {request.path}")
+        """Process a request and queue metrics for async transmission.
 
+        This method is synchronous and does not require an event loop.
+        Events are placed in a thread-safe queue and processed by the
+        background thread.
+        """
         # Initialize custom_data attribute on the request object
         request.cerberus_metrics = {}
 
         # Process the request first
         response = self.get_response(request)
-        
+
         # Extract metrics from response if they exist
         metrics = {}
         if hasattr(response, 'data') and isinstance(response.data, dict):
             if '_cerberus_metrics' in response.data:
                 metrics = response.data.pop('_cerberus_metrics')
-        
-        # After the view has executed, create and store the CoreData
+
         # Hash PII (source IP) if secret_key is configured
         source_ip = request.META.get('REMOTE_ADDR')
         if 'secret_key' in self.config:
             source_ip = hash_pii(source_ip, self.config['secret_key'])
 
+        # Create the event data
         d = CoreData(
             self.config.get('token', ''),
             source_ip,
@@ -231,35 +311,13 @@ class CerberusMiddleware:
             request.method,
             custom_data=metrics
         )
-        # Put the CoreData into the async queue
-        queue = get_buffer_queue()
-        print(f"[Cerberus] Queue object: {queue}")
 
-        if queue is not None:
-            try:
-                print(f"[Cerberus] Queueing event: {request.method} {request.path}")
-                if DEBUG_ENABLED:
-                    logger.info(f"[Cerberus] Queueing event: {request.method} {request.path}")
-
-                loop = asyncio.get_event_loop()
-                print(f"[Cerberus] Event loop: {loop}, is_running: {loop.is_running()}")
-
-                if loop.is_running():
-                    task = asyncio.create_task(queue.put(d))
-                    print(f"[Cerberus] Created async task: {task}")
-                else:
-                    print(f"[Cerberus] Event loop not running, using run_until_complete")
-                    loop.run_until_complete(queue.put(d))
-                    print(f"[Cerberus] Event queued via run_until_complete")
-            except RuntimeError as e:
-                print(f"[Cerberus] RuntimeError: {e}")
-                # If no event loop is running, fallback to synchronous put (should not happen in ASGI)
-                asyncio.run(queue.put(d))
-            except Exception as e:
-                print(f"[Cerberus] Unexpected error queueing event: {e}")
-                logger.error(f"[Cerberus] Error queueing event: {e}")
-        else:
-            print(f"[Cerberus] WARNING: Queue is None, event not queued!")
+        # Queue the event (non-blocking)
+        try:
+            event_queue.put_nowait(d)
+            if DEBUG_ENABLED:
+                logger.info(f"[Cerberus] Queued event: {request.method} {request.path}")
+        except thread_queue.Full:
+            logger.warning("[Cerberus] Event queue full, dropping event")
 
         return response
-    
