@@ -13,7 +13,7 @@ Architecture:
 """
 
 from .structs import CoreData
-from .utils import hash_pii, fetch_secret_key
+from .utils import fetch_secret_key
 from django.conf import settings
 import asyncio
 import json
@@ -21,6 +21,7 @@ import os
 import logging
 import threading
 import queue as thread_queue
+from datetime import datetime, timezone
 import websockets
 
 # Configure logging
@@ -88,17 +89,23 @@ class AsyncWebSocketClient:
                         'api_key': self.api_key,
                         'client_id': self.client_id,
                         'token': event_data.token,
-                        'source_ip': event_data.source_ip,
+                        'remote_addr': event_data.source_ip,  # Backend expects 'remote_addr'
                         'endpoint': event_data.endpoint,
                         'scheme': event_data.scheme,
                         'method': event_data.method,
-                        'custom_data': event_data.custom_data
+                        'timestamp': event_data.timestamp,
+                        'custom_data': event_data.custom_data,
+                        # Additional request details
+                        'headers': event_data.headers,
+                        'query_params': event_data.query_params,
+                        'body': event_data.body,
+                        'user_agent': event_data.user_agent,
                     }
 
                     json_data = json.dumps(payload)
 
                     if DEBUG_ENABLED:
-                        logger.info(f"[Cerberus] Sending event to backend: {json_data[:150]}...")
+                        logger.info(f"[Cerberus] Sending event to backend: {json_data[:200]}...")
 
                     await self.websocket.send(json_data)
 
@@ -226,6 +233,77 @@ def ensure_background_thread():
             logger.info("[Cerberus] Started background event sender thread")
 
 
+def _extract_headers(request):
+    """Extract HTTP headers from Django request.
+
+    Converts Django's META dict (with HTTP_ prefixed headers) to a clean dict.
+    Only includes actual HTTP headers, not server variables.
+
+    Args:
+        request: Django HttpRequest object
+
+    Returns:
+        Dict of header name -> value
+    """
+    headers = {}
+    for key, value in request.META.items():
+        if key.startswith('HTTP_'):
+            # Convert HTTP_CONTENT_TYPE to Content-Type
+            header_name = key[5:].replace('_', '-').title()
+            headers[header_name] = value
+        elif key in ('CONTENT_TYPE', 'CONTENT_LENGTH'):
+            # These don't have HTTP_ prefix but are still headers
+            header_name = key.replace('_', '-').title()
+            headers[header_name] = value
+    return headers if headers else None
+
+
+def _extract_query_params(request):
+    """Extract query parameters from Django request.
+
+    Args:
+        request: Django HttpRequest object
+
+    Returns:
+        Dict of query param name -> value (or list of values if multiple)
+    """
+    if not request.GET:
+        return None
+
+    params = {}
+    for key in request.GET:
+        values = request.GET.getlist(key)
+        params[key] = values[0] if len(values) == 1 else values
+    return params
+
+
+def _extract_body(request):
+    """Extract request body from Django request.
+
+    Only attempts to parse JSON bodies. Returns None for non-JSON content.
+
+    Args:
+        request: Django HttpRequest object
+
+    Returns:
+        Parsed JSON body as dict, or None
+    """
+    if request.method not in ('POST', 'PUT', 'PATCH'):
+        return None
+
+    content_type = request.content_type or ''
+    if 'application/json' not in content_type:
+        return None
+
+    try:
+        if request.body:
+            return json.loads(request.body.decode('utf-8'))
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        pass
+
+    return None
+
+
 class CerberusMiddleware:
     """Django middleware for capturing and sending HTTP request metrics.
 
@@ -288,7 +366,13 @@ class CerberusMiddleware:
         # Initialize custom_data attribute on the request object
         request.cerberus_metrics = {}
 
-        # Process the request first
+        # Extract request data BEFORE processing (body can only be read once)
+        headers = _extract_headers(request)
+        query_params = _extract_query_params(request)
+        body = _extract_body(request)
+        user_agent = request.META.get('HTTP_USER_AGENT')
+
+        # Process the request
         response = self.get_response(request)
 
         # Extract metrics from response if they exist
@@ -297,19 +381,22 @@ class CerberusMiddleware:
             if '_cerberus_metrics' in response.data:
                 metrics = response.data.pop('_cerberus_metrics')
 
-        # Hash PII (source IP) if secret_key is configured
+        # Get source IP address
         source_ip = request.META.get('REMOTE_ADDR')
-        if 'secret_key' in self.config:
-            source_ip = hash_pii(source_ip, self.config['secret_key'])
 
-        # Create the event data
+        # Create the event data with current timestamp
         d = CoreData(
-            self.config.get('token', ''),
-            source_ip,
-            request.path,
-            request.scheme == 'https',
-            request.method,
-            custom_data=metrics
+            token=self.config.get('token', ''),
+            source_ip=source_ip,
+            endpoint=request.path,
+            scheme=request.scheme == 'https',
+            method=request.method,
+            timestamp=datetime.now(timezone.utc).isoformat(),
+            custom_data=metrics,
+            headers=headers,
+            query_params=query_params,
+            body=body,
+            user_agent=user_agent,
         )
 
         # Queue the event (non-blocking)
