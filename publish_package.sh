@@ -7,5 +7,5 @@ rm -rf dist/ build/ *.egg-info src/*.egg-info
 # Build the package
 python -m build
 
-# Upload to Test PyPI
-python -m twine upload --repository testpypi dist/*
+# Upload to PyPI
+python -m twine upload dist/*

@@ -9,5 +9,5 @@ from .middleware import CerberusMiddleware
 from .structs import CoreData
 from .utils import hash_pii
 
-__version__ = "0.1.3"
+__version__ = "0.1.4"
 __all__ = ["CerberusMiddleware", "CoreData", "hash_pii", "__version__"]
