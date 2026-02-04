@@ -100,6 +100,7 @@ class AsyncWebSocketClient:
                         'query_params': event_data.query_params,
                         'body': event_data.body,
                         'user_agent': event_data.user_agent,
+                        'user_id': event_data.user_id,
                     }
 
                     json_data = json.dumps(payload)
@@ -375,6 +376,9 @@ class CerberusMiddleware:
         # Process the request
         response = self.get_response(request)
 
+        # Extract user_id set by application (e.g., JWT auth decorators)
+        user_id = getattr(request, 'cerberus_user_id', None)
+
         # Extract metrics from response if they exist
         metrics = {}
         if hasattr(response, 'data') and isinstance(response.data, dict):
@@ -397,6 +401,7 @@ class CerberusMiddleware:
             query_params=query_params,
             body=body,
             user_agent=user_agent,
+            user_id=user_id,
         )
 
         # Queue the event (non-blocking)

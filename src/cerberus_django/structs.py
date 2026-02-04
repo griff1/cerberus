@@ -21,3 +21,4 @@ class CoreData:
     query_params: Optional[Dict] = None
     body: Optional[Dict] = None
     user_agent: Optional[str] = None
+    user_id: Optional[str] = None
