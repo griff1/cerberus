@@ -13,7 +13,7 @@ Architecture:
 """
 
 from .structs import CoreData
-from .utils import fetch_secret_key
+from .utils import fetch_secret_key, hash_pii
 from django.conf import settings
 import asyncio
 import json
@@ -234,14 +234,36 @@ def ensure_background_thread():
             logger.info("[Cerberus] Started background event sender thread")
 
 
-def _extract_headers(request):
+# Headers that are always stripped from captured data
+SENSITIVE_HEADERS = frozenset({
+    'HTTP_COOKIE',
+    'HTTP_SET_COOKIE',
+    'HTTP_X_API_KEY',
+    'HTTP_X_AUTH_TOKEN',
+    'HTTP_PROXY_AUTHORIZATION',
+})
+
+# Query param / body keys whose values should be redacted
+SENSITIVE_KEYS = frozenset({
+    'password', 'passwd', 'secret', 'token', 'api_key', 'apikey',
+    'api_secret', 'access_token', 'refresh_token', 'authorization',
+    'auth', 'credential', 'credentials', 'private_key', 'ssh_key',
+    'session_token', 'credit_card', 'card_number', 'cvv', 'ssn',
+})
+
+REDACTED = '[REDACTED]'
+
+
+def _extract_headers(request, secret_key=None):
     """Extract HTTP headers from Django request.
 
     Converts Django's META dict (with HTTP_ prefixed headers) to a clean dict.
-    Only includes actual HTTP headers, not server variables.
+    Redacts sensitive headers (Cookie, X-Api-Key, etc.).
+    Hashes the Authorization header if secret_key is available; redacts otherwise.
 
     Args:
         request: Django HttpRequest object
+        secret_key: Optional HMAC secret key for hashing sensitive headers
 
     Returns:
         Dict of header name -> value
@@ -249,11 +271,15 @@ def _extract_headers(request):
     headers = {}
     for key, value in request.META.items():
         if key.startswith('HTTP_'):
-            # Convert HTTP_CONTENT_TYPE to Content-Type
+            if key in SENSITIVE_HEADERS:
+                header_name = key[5:].replace('_', '-').title()
+                headers[header_name] = REDACTED
+                continue
+            if key == 'HTTP_AUTHORIZATION':
+                value = hash_pii(value, secret_key) if secret_key else REDACTED
             header_name = key[5:].replace('_', '-').title()
             headers[header_name] = value
         elif key in ('CONTENT_TYPE', 'CONTENT_LENGTH'):
-            # These don't have HTTP_ prefix but are still headers
             header_name = key.replace('_', '-').title()
             headers[header_name] = value
     return headers if headers else None
@@ -261,6 +287,8 @@ def _extract_headers(request):
 
 def _extract_query_params(request):
     """Extract query parameters from Django request.
+
+    Redacts values for sensitive parameter names.
 
     Args:
         request: Django HttpRequest object
@@ -273,21 +301,49 @@ def _extract_query_params(request):
 
     params = {}
     for key in request.GET:
-        values = request.GET.getlist(key)
-        params[key] = values[0] if len(values) == 1 else values
+        if key.lower() in SENSITIVE_KEYS:
+            params[key] = REDACTED
+        else:
+            values = request.GET.getlist(key)
+            params[key] = values[0] if len(values) == 1 else values
     return params
+
+
+def _sanitize_dict(data):
+    """Recursively redact sensitive keys in a dict.
+
+    Args:
+        data: Dict to sanitize
+
+    Returns:
+        New dict with sensitive values replaced by REDACTED
+    """
+    if not isinstance(data, dict):
+        return data
+    sanitized = {}
+    for key, value in data.items():
+        if key.lower() in SENSITIVE_KEYS:
+            sanitized[key] = REDACTED
+        elif isinstance(value, dict):
+            sanitized[key] = _sanitize_dict(value)
+        elif isinstance(value, list):
+            sanitized[key] = [_sanitize_dict(item) if isinstance(item, dict) else item for item in value]
+        else:
+            sanitized[key] = value
+    return sanitized
 
 
 def _extract_body(request):
     """Extract request body from Django request.
 
-    Only attempts to parse JSON bodies. Returns None for non-JSON content.
+    Only attempts to parse JSON bodies. Redacts sensitive keys.
+    Returns None for non-JSON content.
 
     Args:
         request: Django HttpRequest object
 
     Returns:
-        Parsed JSON body as dict, or None
+        Sanitized parsed JSON body as dict, or None
     """
     if request.method not in ('POST', 'PUT', 'PATCH'):
         return None
@@ -298,7 +354,10 @@ def _extract_body(request):
 
     try:
         if request.body:
-            return json.loads(request.body.decode('utf-8'))
+            body = json.loads(request.body.decode('utf-8'))
+            if isinstance(body, dict):
+                return _sanitize_dict(body)
+            return body
     except (json.JSONDecodeError, UnicodeDecodeError):
         pass
 
@@ -368,7 +427,7 @@ class CerberusMiddleware:
         request.cerberus_metrics = {}
 
         # Extract request data BEFORE processing (body can only be read once)
-        headers = _extract_headers(request)
+        headers = _extract_headers(request, self.config.get('secret_key'))
         query_params = _extract_query_params(request)
         body = _extract_body(request)
         user_agent = request.META.get('HTTP_USER_AGENT')

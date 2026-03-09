@@ -133,7 +133,22 @@ Each event sent to your analytics backend includes:
     "source_ip": "hashed-ip-address",
     "endpoint": "/api/users/",
     "scheme": true,
-    "method": "GET",
+    "method": "POST",
+    "headers": {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "Cookie": "[REDACTED]",
+        "Authorization": "[REDACTED]"
+    },
+    "query_params": {
+        "page": "1",
+        "api_key": "[REDACTED]"
+    },
+    "body": {
+        "username": "alice",
+        "password": "[REDACTED]"
+    },
+    "user_agent": "Mozilla/5.0 ...",
     "custom_data": {
         "items_processed": 10,
         "cache_hit": true
@@ -159,15 +174,25 @@ When a `secret_key` is configured, source IP addresses are hashed using HMAC-SHA
 | `endpoint` | Request path | Sent as-is |
 | `method` | HTTP method (GET, POST, etc.) | Sent as-is |
 | `scheme` | Whether HTTPS was used | Sent as-is |
+| `headers` | HTTP request headers | Sensitive headers redacted (see below) |
+| `query_params` | URL query parameters | Sensitive keys redacted |
+| `body` | JSON request body (POST/PUT/PATCH only) | Sensitive keys redacted |
+| `user_agent` | Browser/client user agent | Sent as-is |
 | `custom_data` | Your custom metrics | Sent as-is |
+
+### Automatic Sanitization
+
+Sensitive values are automatically redacted before transmission:
+
+- **Headers**: `Cookie`, `Set-Cookie`, `X-Api-Key`, `X-Auth-Token`, and `Proxy-Authorization` values are replaced with `[REDACTED]`. The `Authorization` header is hashed if `secret_key` is configured, otherwise redacted.
+- **Query parameters**: Keys matching sensitive names (`password`, `token`, `api_key`, `secret`, `access_token`, etc.) have their values replaced with `[REDACTED]`.
+- **Request body**: JSON bodies are recursively scanned and sensitive keys are redacted using the same key list.
 
 ### What's NOT Captured
 
-- Request/response bodies
-- HTTP headers
-- Query parameters
-- Cookies or session data
-- Authentication tokens
+- Response bodies
+- Non-JSON request bodies (form data, multipart uploads, etc.)
+- Server-internal variables (only HTTP headers are extracted)
 
 ## Debug Mode
 
