@@ -33,7 +33,7 @@ def sanitize_arguments(args):
 
     sanitized = {}
     for key, value in args.items():
-        if key.lower() in SENSITIVE_KEYS:
+        if isinstance(key, str) and key.lower() in SENSITIVE_KEYS:
             sanitized[key] = REDACTED
         elif isinstance(value, (dict, list, tuple)):
             sanitized[key] = sanitize_dict(list(value) if isinstance(value, tuple) else value)

@@ -348,8 +348,13 @@ def _extract_body(request):
     except (json.JSONDecodeError, UnicodeDecodeError):
         pass
     except Exception as e:
-        # Handles RawPostDataException from streaming/chunked ASGI requests
-        logger.debug(f"[Cerberus] Could not read request body: {type(e).__name__}: {e}")
+        # RawPostDataException is expected for streaming/chunked ASGI requests;
+        # anything else is unexpected and logged at WARNING for visibility
+        exc_name = type(e).__name__
+        if exc_name == 'RawPostDataException':
+            logger.debug(f"[Cerberus] Could not read request body: {exc_name}")
+        else:
+            logger.warning(f"[Cerberus] Unexpected error reading request body: {exc_name}: {e}")
 
     return None
 

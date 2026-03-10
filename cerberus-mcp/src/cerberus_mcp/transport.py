@@ -141,6 +141,13 @@ def init_client(ws_url, api_key, client_id):
         )
 
     with _thread_lock:
+        if _ws_client is not None:
+            logger.warning(
+                f"[CerberusMCP] Overwriting existing WebSocket client "
+                f"({_ws_client.ws_url}) with new target: {ws_url}. "
+                f"Multiple CerberusMCP instances share a single transport — "
+                f"all events will be sent to the new backend."
+            )
         _ws_client = AsyncWebSocketClient(ws_url, api_key, client_id)
     _ensure_background_thread()
     if DEBUG_ENABLED:

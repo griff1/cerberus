@@ -51,6 +51,12 @@ class TestSanitizeArguments:
         assert "_raw" in result
         assert result["_raw"] == "raw string"
 
+    def test_non_string_keys_do_not_crash(self):
+        args = {0: "positional", "query": "hello"}
+        result = sanitize_arguments(args)
+        assert result[0] == "positional"
+        assert result["query"] == "hello"
+
     def test_sanitizes_nested_dicts(self):
         args = {"config": {"token": "abc", "host": "localhost"}}
         result = sanitize_arguments(args)

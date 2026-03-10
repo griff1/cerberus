@@ -37,7 +37,7 @@ classifiers = [
 ]
 requires-python = ">=3.10"
 dependencies = [
-    "mcp>=1.0",
+    "mcp>=1.0,<2.0",
     "websockets>=12.0",
     "cerberus-core>=0.1.0",
 ]
@@ -64,3 +64,7 @@ exclude = [
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/cerberus_mcp"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

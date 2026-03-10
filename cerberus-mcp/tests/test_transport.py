@@ -1,11 +1,12 @@
 """Tests for cerberus_mcp transport layer."""
 
+import logging
 import queue as thread_queue
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-from cerberus_mcp.transport import queue_event, _shutdown, event_queue
+from cerberus_mcp.transport import queue_event, init_client, _shutdown, event_queue
 
 
 class TestQueueEvent:
@@ -43,6 +44,33 @@ class TestQueueEvent:
                 queue_event(event)
         finally:
             pass
+
+
+class TestInitClient:
+    """Tests for init_client behavior."""
+
+    @patch("cerberus_mcp.transport._ensure_background_thread")
+    def test_warns_on_overwrite(self, mock_bg, caplog):
+        """Second init_client call should warn about overwriting."""
+        import cerberus_mcp.transport as transport_mod
+        old = transport_mod._ws_client
+        try:
+            transport_mod._ws_client = None
+            init_client("wss://first:8765", "key1", "cid1")
+            with caplog.at_level(logging.WARNING, logger="cerberus_mcp.transport"):
+                init_client("wss://second:8765", "key2", "cid2")
+            assert "Overwriting" in caplog.text
+            assert "wss://second:8765" in caplog.text
+        finally:
+            transport_mod._ws_client = old
+
+    @patch("cerberus_mcp.transport._ensure_background_thread")
+    def test_no_warn_on_first_init(self, mock_bg, caplog):
+        """First init_client call should not warn."""
+        with patch("cerberus_mcp.transport._ws_client", None):
+            with caplog.at_level(logging.WARNING, logger="cerberus_mcp.transport"):
+                init_client("wss://backend:8765", "key", "cid")
+        assert "Overwriting" not in caplog.text
 
 
 class TestShutdown:
