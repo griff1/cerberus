@@ -18,5 +18,5 @@ MAX_RESULT_LENGTH = 100
 EVENT_QUEUE_MAXSIZE = 10_000
 
 # Package version and user agent
-VERSION = "0.1.1"
+VERSION = "0.1.3"
 USER_AGENT = f"cerberus-mcp/{VERSION}"
