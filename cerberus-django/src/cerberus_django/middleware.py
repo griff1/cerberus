@@ -12,18 +12,21 @@ Architecture:
 - Background thread: Runs its own event loop to process queue and send via WebSocket
 """
 
+import asyncio
+import atexit
+import json
+import logging
+import os
+import queue as thread_queue
+import threading
+from datetime import datetime, timezone
+
+import websockets
+from django.conf import settings
+
+from cerberus_core import REDACTED, SENSITIVE_HEADERS, SENSITIVE_KEYS, hash_pii, normalize_ip, sanitize_dict
 from .structs import CoreData
 from .utils import fetch_secret_key
-from cerberus_core import REDACTED, SENSITIVE_HEADERS, SENSITIVE_KEYS, hash_pii, sanitize_dict
-from django.conf import settings
-import asyncio
-import json
-import os
-import logging
-import threading
-import queue as thread_queue
-from datetime import datetime, timezone
-import websockets
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -83,6 +86,8 @@ class AsyncWebSocketClient:
             if self.websocket:
                 try:
                     # Format data as expected by backend
+                    # api_key: client credential used by event_ingest for authentication
+                    # token: duplicated from event_data for backward compat; backend uses api_key
                     payload = {
                         'api_key': self.api_key,
                         'client_id': self.client_id,
@@ -158,7 +163,7 @@ async def _process_queue_async():
     if DEBUG_ENABLED:
         logger.info("[Cerberus] Background queue processor started")
 
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
 
     while True:
         try:
@@ -237,6 +242,22 @@ def ensure_background_thread():
         if DEBUG_ENABLED:
             logger.info("[Cerberus] Started background event sender thread")
 
+
+def _shutdown():
+    """Drain the event queue on process exit.
+
+    Sends a shutdown sentinel (None) and waits briefly for the background
+    thread to finish processing remaining events.
+    """
+    if _background_thread is not None and _background_thread.is_alive():
+        try:
+            event_queue.put_nowait(None)
+        except thread_queue.Full:
+            return
+        _background_thread.join(timeout=2.0)
+
+
+atexit.register(_shutdown)
 
 
 
@@ -326,9 +347,9 @@ def _extract_body(request):
             return None
     except (json.JSONDecodeError, UnicodeDecodeError):
         pass
-    except Exception:
+    except Exception as e:
         # Handles RawPostDataException from streaming/chunked ASGI requests
-        pass
+        logger.debug(f"[Cerberus] Could not read request body: {type(e).__name__}: {e}")
 
     return None
 
@@ -349,6 +370,7 @@ class CerberusMiddleware:
     def __init__(self, get_response):
         self.get_response = get_response
         self.config = dict(getattr(settings, 'CERBERUS_CONFIG', {}))
+        self._warned_no_secret_key = False
 
         if DEBUG_ENABLED:
             logger.info("[Cerberus] Middleware initializing...")
@@ -422,11 +444,17 @@ class CerberusMiddleware:
                 raw_metrics = response.data.pop('_cerberus_metrics')
                 metrics = sanitize_dict(raw_metrics) if isinstance(raw_metrics, dict) else {}
 
-        # Get source IP address and hash for PII protection
-        source_ip = request.META.get('REMOTE_ADDR')
+        # Get source IP address, normalize, and hash for PII protection
+        source_ip = normalize_ip(request.META.get('REMOTE_ADDR'))
         secret_key = self.config.get('secret_key')
         if secret_key and source_ip:
             source_ip = hash_pii(source_ip, secret_key)
+        elif source_ip and not self._warned_no_secret_key:
+            self._warned_no_secret_key = True
+            logger.warning(
+                "[Cerberus] Sending source IP in plaintext — no secret_key configured. "
+                "Set secret_key in CERBERUS_CONFIG or configure backend_url to enable PII hashing."
+            )
 
         # Create the event data with current timestamp
         d = CoreData(

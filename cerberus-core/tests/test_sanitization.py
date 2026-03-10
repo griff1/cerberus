@@ -6,6 +6,7 @@ from cerberus_core.sanitization import (
     SENSITIVE_HEADERS,
     SENSITIVE_KEYS,
     hash_pii,
+    normalize_ip,
     sanitize_dict,
 )
 
@@ -91,6 +92,41 @@ class TestHashPii:
         str_result = hash_pii("192.168.1.1", "key")
         bytes_result = hash_pii(b"192.168.1.1", b"key")
         assert str_result == bytes_result
+
+
+class TestNormalizeIp:
+    """Test IP address normalization."""
+
+    def test_ipv4_passthrough(self):
+        assert normalize_ip("192.168.1.1") == "192.168.1.1"
+
+    def test_ipv6_compressed(self):
+        assert normalize_ip("::1") == "::1"
+        assert normalize_ip("0000:0000:0000:0000:0000:0000:0000:0001") == "::1"
+
+    def test_ipv6_zone_id_stripped(self):
+        assert normalize_ip("fe80::1%eth0") == "fe80::1"
+        assert normalize_ip("fe80::1%25en0") == "fe80::1"
+
+    def test_consistent_hash_with_and_without_zone_id(self):
+        """Same logical IP with and without zone ID should hash identically."""
+        ip_with_zone = normalize_ip("fe80::1%eth0")
+        ip_without_zone = normalize_ip("fe80::1")
+        h1 = hash_pii(ip_with_zone, "key")
+        h2 = hash_pii(ip_without_zone, "key")
+        assert h1 == h2
+
+    def test_none_returns_none(self):
+        assert normalize_ip(None) is None
+
+    def test_invalid_ip_passthrough(self):
+        assert normalize_ip("not-an-ip") == "not-an-ip"
+        assert normalize_ip("") == ""
+
+    def test_ipv4_mapped_ipv6(self):
+        """IPv4-mapped IPv6 addresses are normalized to canonical hex form."""
+        result = normalize_ip("::ffff:192.168.1.1")
+        assert result == "::ffff:c0a8:101"
 
 
 class TestSanitizeDict:

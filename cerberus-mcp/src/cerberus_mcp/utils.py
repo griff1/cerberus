@@ -35,8 +35,8 @@ def sanitize_arguments(args):
     for key, value in args.items():
         if key.lower() in SENSITIVE_KEYS:
             sanitized[key] = REDACTED
-        elif isinstance(value, (dict, list)):
-            sanitized[key] = sanitize_dict(value)
+        elif isinstance(value, (dict, list, tuple)):
+            sanitized[key] = sanitize_dict(list(value) if isinstance(value, tuple) else value)
         else:
             sanitized[key] = _truncate_value(value)
     return sanitized

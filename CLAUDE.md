@@ -49,6 +49,7 @@ Shared utilities used by both cerberus-django and cerberus-mcp:
 - `SENSITIVE_HEADERS` — HTTP headers to always redact
 - `REDACTED` — sentinel string `[REDACTED]`
 - `sanitize_dict()` — recursive dict/list sanitization
+- `hash_pii()` — HMAC-SHA256 pseudoanonymization for PII values
 
 **Tests:** `cd cerberus-core && .venv/bin/python -m pytest tests/ -v`
 

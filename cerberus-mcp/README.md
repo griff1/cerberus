@@ -22,7 +22,7 @@ mcp = CerberusMCP(
     cerberus_config={
         "token": "your-api-key",
         "client_id": "your-client-id",
-        "ws_url": "ws://your-cerberus-backend:8765",
+        "ws_url": "wss://your-cerberus-backend:8765",
     }
 )
 

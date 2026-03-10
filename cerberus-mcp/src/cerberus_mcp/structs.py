@@ -6,7 +6,7 @@ CoreData format expected by the Cerberus event_ingest pipeline.
 """
 
 from dataclasses import dataclass
-from typing import Dict, Optional
+from typing import Dict, Optional, Union
 
 
 @dataclass
@@ -20,7 +20,7 @@ class MCPEventData:
         - token: API key for authentication (from cerberus_config)
         - source_ip: Client IP for SSE/HTTP transports, "mcp-local" for stdio
         - endpoint: mcp://{server_name}/{handler_name}
-        - scheme: Always True (MCP uses structured transport)
+        - scheme: "mcp" (distinguishes MCP transport from HTTP)
         - method: Event type (mcp_tool_call, mcp_resource_read, mcp_prompt_get)
         - timestamp: ISO 8601 UTC timestamp
         - custom_data: MCP-specific metadata (see below)
@@ -47,7 +47,7 @@ class MCPEventData:
     token: str
     source_ip: str
     endpoint: str
-    scheme: bool
+    scheme: Union[bool, str]
     method: str
     timestamp: str  # ISO 8601 format timestamp
     custom_data: Optional[Dict] = None

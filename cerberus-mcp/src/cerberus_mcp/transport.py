@@ -7,6 +7,7 @@ cerberus_django middleware.
 """
 
 import asyncio
+import atexit
 import json
 import logging
 import threading
@@ -69,6 +70,8 @@ class AsyncWebSocketClient:
             if self.websocket:
                 try:
                     # Format data as expected by backend (same as cerberus_django)
+                    # api_key: client credential used by event_ingest for authentication
+                    # token: duplicated from event_data for backward compat; backend uses api_key
                     payload = {
                         'api_key': self.api_key,
                         'client_id': self.client_id,
@@ -168,7 +171,7 @@ async def _process_queue_async():
     if DEBUG_ENABLED:
         logger.info("[CerberusMCP] Background queue processor started")
 
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
 
     while True:
         try:
@@ -236,3 +239,20 @@ def _ensure_background_thread():
 
         if DEBUG_ENABLED:
             logger.info("[CerberusMCP] Started background event sender thread")
+
+
+def _shutdown():
+    """Drain the event queue on process exit.
+
+    Sends a shutdown sentinel (None) and waits briefly for the background
+    thread to finish processing remaining events.
+    """
+    if _background_thread is not None and _background_thread.is_alive():
+        try:
+            event_queue.put_nowait(None)
+        except thread_queue.Full:
+            return
+        _background_thread.join(timeout=2.0)
+
+
+atexit.register(_shutdown)

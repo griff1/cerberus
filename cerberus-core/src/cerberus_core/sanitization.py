@@ -8,6 +8,7 @@ data hygiene.
 
 import hashlib
 import hmac
+import ipaddress
 
 # Sentinel value for redacted fields
 REDACTED = '[REDACTED]'
@@ -31,6 +32,27 @@ SENSITIVE_KEYS = frozenset({
     'session_id', 'session_token', 'cookie',
     'credit_card', 'card_number', 'cvv', 'ssn',
 })
+
+
+def normalize_ip(ip_string):
+    """Normalize an IP address string for consistent hashing.
+
+    Strips IPv6 zone IDs (e.g., ``fe80::1%eth0`` → ``fe80::1``) and
+    compresses IPv6 addresses to their canonical form so the same
+    logical address always produces the same hash.
+
+    Args:
+        ip_string: IP address string to normalize
+
+    Returns:
+        Normalized IP string, or the original string if parsing fails
+    """
+    if ip_string is None:
+        return None
+    try:
+        return str(ipaddress.ip_address(ip_string.split('%')[0].strip()))
+    except (ValueError, AttributeError):
+        return ip_string
 
 
 def hash_pii(value, secret_key):

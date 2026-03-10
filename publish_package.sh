@@ -8,7 +8,7 @@ PKG_DIR="$REPO_ROOT/$PACKAGE"
 if [ ! -d "$PKG_DIR" ]; then
     echo "Error: Package directory not found: $PKG_DIR"
     echo "Available packages:"
-    ls -d "$REPO_ROOT"/cerberus-*/
+    find "$REPO_ROOT" -maxdepth 1 -type d -name 'cerberus-*' | sort
     exit 1
 fi
 
@@ -19,6 +19,14 @@ rm -rf dist/ build/ *.egg-info src/*.egg-info
 
 # Build the package
 uv build
+
+# Verify dist/ contains exactly the expected artifacts (1 sdist + 1 wheel)
+ARTIFACT_COUNT=$(find dist/ -type f | wc -l | tr -d ' ')
+if [ "$ARTIFACT_COUNT" -ne 2 ]; then
+    echo "Error: Expected 2 artifacts in dist/ (sdist + wheel), found $ARTIFACT_COUNT:"
+    ls -la dist/
+    exit 1
+fi
 
 # Confirm before publishing
 echo ""

@@ -10,6 +10,7 @@ from .sanitization import (
     SENSITIVE_HEADERS,
     SENSITIVE_KEYS,
     hash_pii,
+    normalize_ip,
     sanitize_dict,
 )
 
@@ -19,6 +20,7 @@ __all__ = [
     "SENSITIVE_HEADERS",
     "SENSITIVE_KEYS",
     "hash_pii",
+    "normalize_ip",
     "sanitize_dict",
     "__version__",
 ]

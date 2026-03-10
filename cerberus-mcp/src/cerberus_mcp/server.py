@@ -17,7 +17,7 @@ from weakref import WeakKeyDictionary
 
 from mcp.server.fastmcp import FastMCP
 
-from cerberus_core import hash_pii
+from cerberus_core import hash_pii, normalize_ip
 
 from .config import DEBUG_ENABLED, USER_AGENT
 from .structs import MCPEventData
@@ -69,6 +69,10 @@ def _extract_source_ip(ctx) -> Optional[str]:
     For SSE/StreamableHTTP transports, the session's transport wraps a
     Starlette ASGI scope that contains the client's (host, port) tuple.
     For stdio transport, there is no network connection so this returns None.
+
+    NOTE: This probes private MCP SDK attributes (_transport, _scope, etc.)
+    that may change across SDK versions. Validated against mcp>=1.0,<2.0.
+    Revisit if upgrading the MCP SDK.
 
     Args:
         ctx: MCP Context object
@@ -161,6 +165,7 @@ class CerberusMCP(FastMCP):
         self._cerberus_config = cerberus_config or {}
         self._server_name = self._cerberus_config.get('server_name', name)
         self._secret_key = self._cerberus_config.get('secret_key')
+        self._warned_no_secret_key = False
         self._session_ids: WeakKeyDictionary = WeakKeyDictionary()
 
         # Initialize transport if config is complete
@@ -300,15 +305,23 @@ class CerberusMCP(FastMCP):
 
         source_ip = context_info.get('source_ip') or "mcp-local"
 
-        # Hash source IP for PII protection (same as cerberus-django)
+        # Normalize and hash source IP for PII protection (same as cerberus-django)
+        if source_ip != "mcp-local":
+            source_ip = normalize_ip(source_ip)
         if self._secret_key and source_ip != "mcp-local":
             source_ip = hash_pii(source_ip, self._secret_key)
+        elif source_ip != "mcp-local" and not self._warned_no_secret_key:
+            self._warned_no_secret_key = True
+            logger.warning(
+                "[CerberusMCP] Sending source IP in plaintext — no secret_key configured. "
+                "Add secret_key to cerberus_config to enable PII hashing."
+            )
 
         event = MCPEventData(
             token=token,
             source_ip=source_ip,
             endpoint=f"mcp://{self._server_name}/{handler_name}",
-            scheme=True,
+            scheme="mcp",
             method=method,
             timestamp=datetime.now(timezone.utc).isoformat(),
             custom_data=custom_data,
@@ -428,7 +441,7 @@ class CerberusMCP(FastMCP):
         parent_decorator = super().resource(uri, **kwargs)
 
         def decorator(func):
-            resource_name = func.__name__
+            resource_name = str(uri)
             wrapped = self._wrap_handler(func, resource_name, "resource_read", METHOD_RESOURCE_READ)
             return parent_decorator(wrapped)
 
