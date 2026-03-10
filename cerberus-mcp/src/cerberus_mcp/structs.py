@@ -5,7 +5,7 @@ Defines the MCPEventData dataclass that maps MCP server events to the
 CoreData format expected by the Cerberus event_ingest pipeline.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Dict, Optional
 
 
@@ -18,7 +18,7 @@ class MCPEventData:
 
     Field mapping:
         - token: API key for authentication (from cerberus_config)
-        - source_ip: Client identifier or "mcp-local"
+        - source_ip: Client IP for SSE/HTTP transports, "mcp-local" for stdio
         - endpoint: mcp://{server_name}/{handler_name}
         - scheme: Always True (MCP uses structured transport)
         - method: Event type (mcp_tool_call, mcp_resource_read, mcp_prompt_get)
@@ -26,8 +26,8 @@ class MCPEventData:
         - custom_data: MCP-specific metadata (see below)
         - headers: None (MCP has no HTTP headers)
         - query_params: None (MCP has no query params)
-        - body: Sanitized arguments dict
-        - user_agent: "cerberus-mcp/0.1.0"
+        - body: Sanitized handler arguments dict
+        - user_agent: "cerberus-mcp/{version}"
         - user_id: MCP client ID if available
 
     custom_data fields:

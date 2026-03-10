@@ -9,7 +9,6 @@ and arguments, then sends events via WebSocket to the Cerberus pipeline.
 import asyncio
 import functools
 import logging
-import os
 import time
 import uuid
 from datetime import datetime, timezone
@@ -18,20 +17,106 @@ from weakref import WeakKeyDictionary
 
 from mcp.server.fastmcp import FastMCP
 
+from cerberus_core import hash_pii
+
+from .config import DEBUG_ENABLED, USER_AGENT
 from .structs import MCPEventData
 from .transport import init_client, queue_event
 from .utils import sanitize_arguments, summarize_result
 
 logger = logging.getLogger(__name__)
 
-DEBUG_ENABLED = os.getenv('CERBERUS_DEBUG', 'false').lower() in ('true', '1', 'yes')
-
-USER_AGENT = "cerberus-mcp/0.1.0"
-
 # Method names for event types
 METHOD_TOOL_CALL = "mcp_tool_call"
 METHOD_RESOURCE_READ = "mcp_resource_read"
 METHOD_PROMPT_GET = "mcp_prompt_get"
+
+# Lazy-loaded MCP Context class reference
+_mcp_context_class = None
+
+
+def _get_mcp_context_class():
+    """Lazily import and cache the MCP Context class."""
+    global _mcp_context_class
+    if _mcp_context_class is None:
+        try:
+            from mcp.server.fastmcp import Context
+            _mcp_context_class = Context
+        except ImportError:
+            # Fallback: use a sentinel that never matches
+            _mcp_context_class = type(None)
+    return _mcp_context_class
+
+
+def _is_mcp_context(obj) -> bool:
+    """Check if an object is an MCP Context.
+
+    Uses the actual imported Context class rather than duck typing
+    to avoid false positives from unrelated classes.
+
+    Args:
+        obj: Object to check
+
+    Returns:
+        True if the object is an MCP Context instance
+    """
+    return isinstance(obj, _get_mcp_context_class())
+
+
+def _extract_source_ip(ctx) -> Optional[str]:
+    """Best-effort extraction of remote client IP from MCP Context.
+
+    For SSE/StreamableHTTP transports, the session's transport wraps a
+    Starlette ASGI scope that contains the client's (host, port) tuple.
+    For stdio transport, there is no network connection so this returns None.
+
+    Args:
+        ctx: MCP Context object
+
+    Returns:
+        Client IP string, or None if not available
+    """
+    try:
+        session = getattr(ctx, 'session', None)
+        if session is None:
+            return None
+
+        # Try to reach the ASGI scope via the transport's request object
+        # SSE: session._transport may have ._read_stream or ._scope
+        # StreamableHTTP: similar path through the transport layer
+        transport = getattr(session, '_transport', None) or getattr(session, 'transport', None)
+        if transport is None:
+            return None
+
+        # Starlette SSE transports often store the ASGI scope or request
+        # Try common attribute paths to find client info
+        for attr in ('_scope', 'scope', '_request', 'request'):
+            obj = getattr(transport, attr, None)
+            if obj is None:
+                continue
+            # ASGI scope dict: scope["client"] = (host, port)
+            if isinstance(obj, dict):
+                client = obj.get('client')
+                if client and isinstance(client, (list, tuple)) and len(client) >= 1:
+                    return str(client[0])
+            # Starlette Request object: request.client.host
+            client = getattr(obj, 'client', None)
+            if client is not None:
+                host = getattr(client, 'host', None)
+                if host:
+                    return str(host)
+
+        # Also check if there's a _client_address stashed on the session itself
+        client_addr = getattr(session, '_client_address', None) or getattr(session, 'client_address', None)
+        if client_addr:
+            if isinstance(client_addr, (list, tuple)):
+                return str(client_addr[0])
+            return str(client_addr)
+
+    except Exception:
+        pass
+
+    return None
 
 
 class CerberusMCP(FastMCP):
@@ -75,6 +160,7 @@ class CerberusMCP(FastMCP):
 
         self._cerberus_config = cerberus_config or {}
         self._server_name = self._cerberus_config.get('server_name', name)
+        self._secret_key = self._cerberus_config.get('secret_key')
         self._session_ids: WeakKeyDictionary = WeakKeyDictionary()
 
         # Initialize transport if config is complete
@@ -121,7 +207,7 @@ class CerberusMCP(FastMCP):
             kwargs: Keyword arguments dict
 
         Returns:
-            Tuple of (cleaned_kwargs, context_info_dict)
+            Tuple of (cleaned_args_dict, context_info_dict)
         """
         context_info = {}
         cleaned_kwargs = dict(kwargs)
@@ -134,12 +220,17 @@ class CerberusMCP(FastMCP):
                 cleaned_kwargs.pop(key, None)
                 break
 
-        # Also check positional args for Context
-        if ctx is None:
-            for arg in args:
-                if _is_mcp_context(arg):
+        # Also check positional args for Context, and collect non-Context args
+        cleaned_positional = {}
+        for i, arg in enumerate(args):
+            if _is_mcp_context(arg):
+                if ctx is None:
                     ctx = arg
-                    break
+            else:
+                cleaned_positional[f"_arg{i}"] = arg
+
+        # Merge positional args into kwargs (kwargs take precedence)
+        all_args = {**cleaned_positional, **cleaned_kwargs}
 
         if ctx is not None:
             # Extract session info
@@ -163,7 +254,10 @@ class CerberusMCP(FastMCP):
             except Exception:
                 pass
 
-        return cleaned_kwargs, context_info
+            # Best-effort source IP extraction for SSE/StreamableHTTP transports
+            context_info['source_ip'] = _extract_source_ip(ctx)
+
+        return all_args, context_info
 
     def _emit_event(
         self,
@@ -195,7 +289,6 @@ class CerberusMCP(FastMCP):
             'handler_name': handler_name,
             'event_type': event_type,
             'duration_ms': round(duration_ms, 2),
-            'arguments': arguments,
             'error': error,
             'result_summary': summarize_result(result) if error is None else None,
             'session_id': context_info.get('session_id'),
@@ -205,9 +298,15 @@ class CerberusMCP(FastMCP):
             'mcp_client_id': context_info.get('mcp_client_id'),
         }
 
+        source_ip = context_info.get('source_ip') or "mcp-local"
+
+        # Hash source IP for PII protection (same as cerberus-django)
+        if self._secret_key and source_ip != "mcp-local":
+            source_ip = hash_pii(source_ip, self._secret_key)
+
         event = MCPEventData(
             token=token,
-            source_ip=context_info.get('mcp_client_id') or "mcp-local",
+            source_ip=source_ip,
             endpoint=f"mcp://{self._server_name}/{handler_name}",
             scheme=True,
             method=method,
@@ -249,7 +348,7 @@ class CerberusMCP(FastMCP):
                     result = await handler(*args, **kwargs)
                     return result
                 except Exception as e:
-                    error_msg = f"{type(e).__name__}: {e}"
+                    error_msg = type(e).__name__
                     raise
                 finally:
                     duration_ms = (time.perf_counter() - start) * 1000
@@ -277,7 +376,7 @@ class CerberusMCP(FastMCP):
                     result = handler(*args, **kwargs)
                     return result
                 except Exception as e:
-                    error_msg = f"{type(e).__name__}: {e}"
+                    error_msg = type(e).__name__
                     raise
                 finally:
                     duration_ms = (time.perf_counter() - start) * 1000
@@ -355,21 +454,3 @@ class CerberusMCP(FastMCP):
             return parent_decorator(wrapped)
 
         return decorator
-
-
-def _is_mcp_context(obj) -> bool:
-    """Check if an object is an MCP Context without importing it.
-
-    Uses duck typing to avoid hard dependency on specific MCP Context class.
-
-    Args:
-        obj: Object to check
-
-    Returns:
-        True if the object looks like an MCP Context
-    """
-    type_name = type(obj).__name__
-    if 'Context' not in type_name:
-        return False
-    # Verify it has expected attributes
-    return hasattr(obj, 'session') or hasattr(obj, 'request_id')

@@ -5,25 +5,12 @@ Argument sanitization and result summarization helpers for MCP event capture.
 """
 
 import logging
-import os
+
+from cerberus_core import REDACTED, SENSITIVE_KEYS, sanitize_dict
+
+from .config import MAX_ARG_STRING_LENGTH
 
 logger = logging.getLogger(__name__)
-
-DEBUG_ENABLED = os.getenv('CERBERUS_DEBUG', 'false').lower() in ('true', '1', 'yes')
-
-# Keys whose values should be redacted from captured arguments
-SENSITIVE_KEYS = frozenset({
-    'password', 'passwd', 'secret', 'token', 'api_key', 'apikey',
-    'api_secret', 'access_token', 'refresh_token', 'authorization',
-    'auth', 'credential', 'credentials', 'private_key', 'ssh_key',
-    'session_id', 'session_token', 'cookie',
-})
-
-# Maximum length for string values in captured arguments
-MAX_ARG_STRING_LENGTH = 200
-
-# Maximum length for result summary strings
-MAX_RESULT_LENGTH = 100
 
 
 def sanitize_arguments(args):
@@ -47,7 +34,9 @@ def sanitize_arguments(args):
     sanitized = {}
     for key, value in args.items():
         if key.lower() in SENSITIVE_KEYS:
-            sanitized[key] = "[REDACTED]"
+            sanitized[key] = REDACTED
+        elif isinstance(value, (dict, list)):
+            sanitized[key] = sanitize_dict(value)
         else:
             sanitized[key] = _truncate_value(value)
     return sanitized

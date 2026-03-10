@@ -9,17 +9,16 @@ cerberus_django middleware.
 import asyncio
 import json
 import logging
-import os
 import threading
 import queue as thread_queue
 import websockets
 
+from .config import DEBUG_ENABLED, EVENT_QUEUE_MAXSIZE
+
 logger = logging.getLogger(__name__)
 
-DEBUG_ENABLED = os.getenv('CERBERUS_DEBUG', 'false').lower() in ('true', '1', 'yes')
-
-# Thread-safe queue for MCP events
-event_queue = thread_queue.Queue()
+# Thread-safe queue for MCP events (bounded to prevent unbounded memory growth)
+event_queue = thread_queue.Queue(maxsize=EVENT_QUEUE_MAXSIZE)
 
 # Background thread management
 _background_thread = None
@@ -38,13 +37,7 @@ class AsyncWebSocketClient:
         self.api_key = api_key
         self.client_id = client_id
         self.websocket = None
-        self._async_lock = None  # Created lazily within event loop context
-
-    async def _get_lock(self):
-        """Get or create async lock within the event loop context."""
-        if self._async_lock is None:
-            self._async_lock = asyncio.Lock()
-        return self._async_lock
+        self._async_lock = None  # Created on first use within the event loop thread
 
     async def connect(self):
         """Establish WebSocket connection to the backend."""
@@ -64,8 +57,11 @@ class AsyncWebSocketClient:
         Args:
             event_data: MCPEventData object to send
         """
-        lock = await self._get_lock()
-        async with lock:
+        # Create lock on first use — safe because the event loop is
+        # single-threaded so no concurrent coroutine can interleave here
+        if self._async_lock is None:
+            self._async_lock = asyncio.Lock()
+        async with self._async_lock:
             # Connect if not already connected
             if self.websocket is None:
                 await self.connect()
@@ -93,7 +89,10 @@ class AsyncWebSocketClient:
                     json_data = json.dumps(payload)
 
                     if DEBUG_ENABLED:
-                        logger.info(f"[CerberusMCP] Sending event: {json_data[:200]}...")
+                        logger.info(
+                            f"[CerberusMCP] Sending event: "
+                            f"{event_data.method} {event_data.endpoint} ({len(json_data)} bytes)"
+                        )
 
                     await self.websocket.send(json_data)
 
@@ -101,7 +100,7 @@ class AsyncWebSocketClient:
                     response = await asyncio.wait_for(self.websocket.recv(), timeout=5.0)
 
                     if DEBUG_ENABLED:
-                        logger.info(f"[CerberusMCP] Backend response: {response}")
+                        logger.info(f"[CerberusMCP] Backend acknowledged ({len(response)} bytes)")
 
                 except asyncio.TimeoutError:
                     logger.warning("[CerberusMCP] Timeout waiting for backend response")
@@ -131,7 +130,15 @@ def init_client(ws_url, api_key, client_id):
         client_id: Client identifier
     """
     global _ws_client
-    _ws_client = AsyncWebSocketClient(ws_url, api_key, client_id)
+
+    if ws_url.startswith('ws://'):
+        logger.warning(
+            "[CerberusMCP] WebSocket URL uses unencrypted ws:// scheme. "
+            "Use wss:// in production to protect API keys and event data in transit."
+        )
+
+    with _thread_lock:
+        _ws_client = AsyncWebSocketClient(ws_url, api_key, client_id)
     _ensure_background_thread()
     if DEBUG_ENABLED:
         logger.info(f"[CerberusMCP] Transport initialized: {ws_url}")
@@ -179,10 +186,13 @@ async def _process_queue_async():
             break
 
         try:
-            if _ws_client:
+            # Read client reference under lock for thread safety
+            with _thread_lock:
+                client = _ws_client
+            if client:
                 if DEBUG_ENABLED:
                     logger.info(f"[CerberusMCP] Processing event: {data.endpoint}")
-                await _ws_client.send(data)
+                await client.send(data)
             else:
                 logger.warning("[CerberusMCP] WebSocket client not initialized, skipping event")
         except Exception as e:

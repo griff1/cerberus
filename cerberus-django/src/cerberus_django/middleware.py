@@ -13,7 +13,8 @@ Architecture:
 """
 
 from .structs import CoreData
-from .utils import fetch_secret_key, hash_pii
+from .utils import fetch_secret_key
+from cerberus_core import REDACTED, SENSITIVE_HEADERS, SENSITIVE_KEYS, hash_pii, sanitize_dict
 from django.conf import settings
 import asyncio
 import json
@@ -30,8 +31,8 @@ logger = logging.getLogger(__name__)
 # Enable debug logging via environment variable
 DEBUG_ENABLED = os.getenv('CERBERUS_DEBUG', 'false').lower() in ('true', '1', 'yes')
 
-# Thread-safe queue for events (no event loop required at import time)
-event_queue = thread_queue.Queue()
+# Thread-safe queue for events (bounded to prevent unbounded memory growth)
+event_queue = thread_queue.Queue(maxsize=10_000)
 
 # Background thread management
 _background_thread = None
@@ -50,13 +51,7 @@ class AsyncWebSocketClient:
         self.api_key = api_key
         self.client_id = client_id
         self.websocket = None
-        self._async_lock = None  # Created lazily within event loop context
-
-    async def _get_lock(self):
-        """Get or create async lock within the event loop context."""
-        if self._async_lock is None:
-            self._async_lock = asyncio.Lock()
-        return self._async_lock
+        self._async_lock = None  # Created on first use within the event loop thread
 
     async def connect(self):
         """Establish WebSocket connection to the backend."""
@@ -76,8 +71,11 @@ class AsyncWebSocketClient:
         Args:
             event_data: CoreData object to send
         """
-        lock = await self._get_lock()
-        async with lock:
+        # Create lock on first use — safe because the event loop is
+        # single-threaded so no concurrent coroutine can interleave here
+        if self._async_lock is None:
+            self._async_lock = asyncio.Lock()
+        async with self._async_lock:
             # Connect if not already connected
             if self.websocket is None:
                 await self.connect()
@@ -106,7 +104,10 @@ class AsyncWebSocketClient:
                     json_data = json.dumps(payload)
 
                     if DEBUG_ENABLED:
-                        logger.info(f"[Cerberus] Sending event to backend: {json_data[:200]}...")
+                        logger.info(
+                            f"[Cerberus] Sending event: "
+                            f"{event_data.method} {event_data.endpoint} ({len(json_data)} bytes)"
+                        )
 
                     await self.websocket.send(json_data)
 
@@ -114,7 +115,7 @@ class AsyncWebSocketClient:
                     response = await asyncio.wait_for(self.websocket.recv(), timeout=5.0)
 
                     if DEBUG_ENABLED:
-                        logger.info(f"[Cerberus] Backend response: {response}")
+                        logger.info(f"[Cerberus] Backend acknowledged ({len(response)} bytes)")
 
                 except asyncio.TimeoutError:
                     logger.warning("[Cerberus] Timeout waiting for backend response")
@@ -177,10 +178,13 @@ async def _process_queue_async():
             break
 
         try:
-            if WS_CLIENT:
+            # Read client reference under lock for thread safety
+            with _thread_lock:
+                client = WS_CLIENT
+            if client:
                 if DEBUG_ENABLED:
                     logger.info(f"[Cerberus] Processing event for endpoint: {data.endpoint}")
-                await WS_CLIENT.send(data)
+                await client.send(data)
             else:
                 logger.warning("[Cerberus] WebSocket client not initialized, skipping event")
         except Exception as e:
@@ -234,24 +238,6 @@ def ensure_background_thread():
             logger.info("[Cerberus] Started background event sender thread")
 
 
-# Headers that are always stripped from captured data
-SENSITIVE_HEADERS = frozenset({
-    'HTTP_COOKIE',
-    'HTTP_SET_COOKIE',
-    'HTTP_X_API_KEY',
-    'HTTP_X_AUTH_TOKEN',
-    'HTTP_PROXY_AUTHORIZATION',
-})
-
-# Query param / body keys whose values should be redacted
-SENSITIVE_KEYS = frozenset({
-    'password', 'passwd', 'secret', 'token', 'api_key', 'apikey',
-    'api_secret', 'access_token', 'refresh_token', 'authorization',
-    'auth', 'credential', 'credentials', 'private_key', 'ssh_key',
-    'session_token', 'credit_card', 'card_number', 'cvv', 'ssn',
-})
-
-REDACTED = '[REDACTED]'
 
 
 def _extract_headers(request, secret_key=None):
@@ -271,13 +257,15 @@ def _extract_headers(request, secret_key=None):
     headers = {}
     for key, value in request.META.items():
         if key.startswith('HTTP_'):
+            header_name = key[5:].replace('_', '-').title()
+            # Authorization gets HMAC-hashed for consistent user tracking;
+            # all other sensitive headers are fully redacted
+            if key == 'HTTP_AUTHORIZATION':
+                headers[header_name] = hash_pii(value, secret_key) if secret_key else REDACTED
+                continue
             if key in SENSITIVE_HEADERS:
-                header_name = key[5:].replace('_', '-').title()
                 headers[header_name] = REDACTED
                 continue
-            if key == 'HTTP_AUTHORIZATION':
-                value = hash_pii(value, secret_key) if secret_key else REDACTED
-            header_name = key[5:].replace('_', '-').title()
             headers[header_name] = value
         elif key in ('CONTENT_TYPE', 'CONTENT_LENGTH'):
             header_name = key.replace('_', '-').title()
@@ -309,30 +297,6 @@ def _extract_query_params(request):
     return params
 
 
-def _sanitize_dict(data):
-    """Recursively redact sensitive keys in a dict.
-
-    Args:
-        data: Dict to sanitize
-
-    Returns:
-        New dict with sensitive values replaced by REDACTED
-    """
-    if not isinstance(data, dict):
-        return data
-    sanitized = {}
-    for key, value in data.items():
-        if key.lower() in SENSITIVE_KEYS:
-            sanitized[key] = REDACTED
-        elif isinstance(value, dict):
-            sanitized[key] = _sanitize_dict(value)
-        elif isinstance(value, list):
-            sanitized[key] = [_sanitize_dict(item) if isinstance(item, dict) else item for item in value]
-        else:
-            sanitized[key] = value
-    return sanitized
-
-
 def _extract_body(request):
     """Extract request body from Django request.
 
@@ -355,10 +319,15 @@ def _extract_body(request):
     try:
         if request.body:
             body = json.loads(request.body.decode('utf-8'))
-            if isinstance(body, dict):
-                return _sanitize_dict(body)
-            return body
+            if isinstance(body, (dict, list)):
+                return sanitize_dict(body)
+            # Discard bare JSON primitives (strings, numbers) —
+            # they can't be meaningfully sanitized and may contain secrets
+            return None
     except (json.JSONDecodeError, UnicodeDecodeError):
+        pass
+    except Exception:
+        # Handles RawPostDataException from streaming/chunked ASGI requests
         pass
 
     return None
@@ -378,10 +347,8 @@ class CerberusMiddleware:
     """
 
     def __init__(self, get_response):
-        global WS_CLIENT
-
         self.get_response = get_response
-        self.config = getattr(settings, 'CERBERUS_CONFIG', {})
+        self.config = dict(getattr(settings, 'CERBERUS_CONFIG', {}))
 
         if DEBUG_ENABLED:
             logger.info("[Cerberus] Middleware initializing...")
@@ -401,13 +368,23 @@ class CerberusMiddleware:
             else:
                 logger.warning("[Cerberus] Failed to fetch secret key. PII will not be hashed.")
 
-        # Initialize WebSocket client
-        if 'ws_url' in self.config and 'token' in self.config and 'client_id' in self.config:
-            WS_CLIENT = AsyncWebSocketClient(
-                self.config['ws_url'],
-                self.config['token'],
-                self.config['client_id']
+        # Warn if WebSocket URL is not using TLS
+        ws_url = self.config.get('ws_url', '')
+        if ws_url.startswith('ws://'):
+            logger.warning(
+                "[Cerberus] WebSocket URL uses unencrypted ws:// scheme. "
+                "Use wss:// in production to protect API keys and event data in transit."
             )
+
+        # Initialize WebSocket client (protected by lock for thread safety)
+        if 'ws_url' in self.config and 'token' in self.config and 'client_id' in self.config:
+            with _thread_lock:
+                global WS_CLIENT
+                WS_CLIENT = AsyncWebSocketClient(
+                    self.config['ws_url'],
+                    self.config['token'],
+                    self.config['client_id']
+                )
             if DEBUG_ENABLED:
                 logger.info(f"[Cerberus] WebSocket client initialized: {self.config['ws_url']}")
         else:
@@ -438,14 +415,18 @@ class CerberusMiddleware:
         # Extract user_id set by application (e.g., JWT auth decorators)
         user_id = getattr(request, 'cerberus_user_id', None)
 
-        # Extract metrics from response if they exist
+        # Extract metrics from response if they exist (sanitize to prevent leaks)
         metrics = {}
         if hasattr(response, 'data') and isinstance(response.data, dict):
             if '_cerberus_metrics' in response.data:
-                metrics = response.data.pop('_cerberus_metrics')
+                raw_metrics = response.data.pop('_cerberus_metrics')
+                metrics = sanitize_dict(raw_metrics) if isinstance(raw_metrics, dict) else {}
 
-        # Get source IP address
+        # Get source IP address and hash for PII protection
         source_ip = request.META.get('REMOTE_ADDR')
+        secret_key = self.config.get('secret_key')
+        if secret_key and source_ip:
+            source_ip = hash_pii(source_ip, secret_key)
 
         # Create the event data with current timestamp
         d = CoreData(
