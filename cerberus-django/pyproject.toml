@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "cerberus-django"
-version = "0.1.5"
+version = "0.1.7"
 description = "Django middleware for capturing and streaming HTTP request metrics via WebSocket"
 readme = "README.md"
 license = "MIT"
@@ -44,6 +44,7 @@ dependencies = [
     "django>=4.0",
     "websockets>=12.0",
     "requests>=2.28.0",
+    "cerberus-core>=0.1.0",
 ]
 
 [project.optional-dependencies]

@@ -1,37 +1,15 @@
-import hmac
-import hashlib
 import requests
 import os
 import logging
 from typing import Optional
+
+from cerberus_core import hash_pii  # noqa: F401 — re-exported for backward compatibility
 
 # Configure logging
 logger = logging.getLogger(__name__)
 
 # Enable debug logging via environment variable
 DEBUG_ENABLED = os.getenv('CERBERUS_DEBUG', 'false').lower() in ('true', '1', 'yes')
-
-def hash_pii(value, secret_key):
-    """
-    Consistently hash PII using HMAC-SHA256 for pseudoanonymization.
-
-    Args:
-        value: The PII string to hash (e.g., IP address)
-        secret_key: Secret key for HMAC (from CERBERUS_CONFIG['secret_key'])
-
-    Returns:
-        Hex-encoded HMAC digest string
-    """
-    if value is None:
-        return None
-
-    # Convert both to bytes if they aren't already
-    if isinstance(value, str):
-        value = value.encode('utf-8')
-    if isinstance(secret_key, str):
-        secret_key = secret_key.encode('utf-8')
-
-    return hmac.new(secret_key, value, hashlib.sha256).hexdigest()
 
 def fetch_secret_key(backend_url: str, api_key: str, timeout: int = 5) -> Optional[str]:
     """
@@ -48,6 +26,12 @@ def fetch_secret_key(backend_url: str, api_key: str, timeout: int = 5) -> Option
     Raises:
         requests.RequestException: On network/HTTP errors
     """
+    if not backend_url.startswith('https://'):
+        logger.warning(
+            "[Cerberus] backend_url does not use https://. "
+            "API key will be sent in plaintext. Use https:// in production."
+        )
+
     try:
         url = f"{backend_url.rstrip('/')}/api/secret-key"
         if DEBUG_ENABLED:
@@ -64,7 +48,13 @@ def fetch_secret_key(backend_url: str, api_key: str, timeout: int = 5) -> Option
 
         response.raise_for_status()
         data = response.json()
+        if not isinstance(data, dict):
+            logger.error(
+                f"[Cerberus] Unexpected response format from {backend_url}: "
+                f"expected dict, got {type(data).__name__}"
+            )
+            return None
         return data.get('secret_key')
-    except requests.RequestException as e:
+    except (requests.RequestException, ValueError, AttributeError) as e:
         logger.error(f"[Cerberus] Failed to fetch secret key from {backend_url}: {e}")
         return None

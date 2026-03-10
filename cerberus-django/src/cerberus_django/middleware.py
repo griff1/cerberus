@@ -12,17 +12,21 @@ Architecture:
 - Background thread: Runs its own event loop to process queue and send via WebSocket
 """
 
+import asyncio
+import atexit
+import json
+import logging
+import os
+import queue as thread_queue
+import threading
+from datetime import datetime, timezone
+
+import websockets
+from django.conf import settings
+
+from cerberus_core import REDACTED, SENSITIVE_HEADERS, SENSITIVE_KEYS, hash_pii, normalize_ip, sanitize_dict
 from .structs import CoreData
 from .utils import fetch_secret_key
-from django.conf import settings
-import asyncio
-import json
-import os
-import logging
-import threading
-import queue as thread_queue
-from datetime import datetime, timezone
-import websockets
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -30,8 +34,8 @@ logger = logging.getLogger(__name__)
 # Enable debug logging via environment variable
 DEBUG_ENABLED = os.getenv('CERBERUS_DEBUG', 'false').lower() in ('true', '1', 'yes')
 
-# Thread-safe queue for events (no event loop required at import time)
-event_queue = thread_queue.Queue()
+# Thread-safe queue for events (bounded to prevent unbounded memory growth)
+event_queue = thread_queue.Queue(maxsize=10_000)
 
 # Background thread management
 _background_thread = None
@@ -50,13 +54,7 @@ class AsyncWebSocketClient:
         self.api_key = api_key
         self.client_id = client_id
         self.websocket = None
-        self._async_lock = None  # Created lazily within event loop context
-
-    async def _get_lock(self):
-        """Get or create async lock within the event loop context."""
-        if self._async_lock is None:
-            self._async_lock = asyncio.Lock()
-        return self._async_lock
+        self._async_lock = None  # Created on first use within the event loop thread
 
     async def connect(self):
         """Establish WebSocket connection to the backend."""
@@ -76,8 +74,11 @@ class AsyncWebSocketClient:
         Args:
             event_data: CoreData object to send
         """
-        lock = await self._get_lock()
-        async with lock:
+        # Create lock on first use — safe because the event loop is
+        # single-threaded so no concurrent coroutine can interleave here
+        if self._async_lock is None:
+            self._async_lock = asyncio.Lock()
+        async with self._async_lock:
             # Connect if not already connected
             if self.websocket is None:
                 await self.connect()
@@ -85,6 +86,8 @@ class AsyncWebSocketClient:
             if self.websocket:
                 try:
                     # Format data as expected by backend
+                    # api_key: client credential used by event_ingest for authentication
+                    # token: duplicated from event_data for backward compat; backend uses api_key
                     payload = {
                         'api_key': self.api_key,
                         'client_id': self.client_id,
@@ -106,7 +109,10 @@ class AsyncWebSocketClient:
                     json_data = json.dumps(payload)
 
                     if DEBUG_ENABLED:
-                        logger.info(f"[Cerberus] Sending event to backend: {json_data[:200]}...")
+                        logger.info(
+                            f"[Cerberus] Sending event: "
+                            f"{event_data.method} {event_data.endpoint} ({len(json_data)} bytes)"
+                        )
 
                     await self.websocket.send(json_data)
 
@@ -114,7 +120,7 @@ class AsyncWebSocketClient:
                     response = await asyncio.wait_for(self.websocket.recv(), timeout=5.0)
 
                     if DEBUG_ENABLED:
-                        logger.info(f"[Cerberus] Backend response: {response}")
+                        logger.info(f"[Cerberus] Backend acknowledged ({len(response)} bytes)")
 
                 except asyncio.TimeoutError:
                     logger.warning("[Cerberus] Timeout waiting for backend response")
@@ -157,7 +163,7 @@ async def _process_queue_async():
     if DEBUG_ENABLED:
         logger.info("[Cerberus] Background queue processor started")
 
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
 
     while True:
         try:
@@ -177,10 +183,13 @@ async def _process_queue_async():
             break
 
         try:
-            if WS_CLIENT:
+            # Read client reference under lock for thread safety
+            with _thread_lock:
+                client = WS_CLIENT
+            if client:
                 if DEBUG_ENABLED:
                     logger.info(f"[Cerberus] Processing event for endpoint: {data.endpoint}")
-                await WS_CLIENT.send(data)
+                await client.send(data)
             else:
                 logger.warning("[Cerberus] WebSocket client not initialized, skipping event")
         except Exception as e:
@@ -234,14 +243,34 @@ def ensure_background_thread():
             logger.info("[Cerberus] Started background event sender thread")
 
 
-def _extract_headers(request):
+def _shutdown():
+    """Drain the event queue on process exit.
+
+    Sends a shutdown sentinel (None) and waits briefly for the background
+    thread to finish processing remaining events.
+    """
+    if _background_thread is not None and _background_thread.is_alive():
+        try:
+            event_queue.put_nowait(None)
+        except thread_queue.Full:
+            return
+        _background_thread.join(timeout=2.0)
+
+
+atexit.register(_shutdown)
+
+
+
+def _extract_headers(request, secret_key=None):
     """Extract HTTP headers from Django request.
 
     Converts Django's META dict (with HTTP_ prefixed headers) to a clean dict.
-    Only includes actual HTTP headers, not server variables.
+    Redacts sensitive headers (Cookie, X-Api-Key, etc.).
+    Hashes the Authorization header if secret_key is available; redacts otherwise.
 
     Args:
         request: Django HttpRequest object
+        secret_key: Optional HMAC secret key for hashing sensitive headers
 
     Returns:
         Dict of header name -> value
@@ -249,11 +278,17 @@ def _extract_headers(request):
     headers = {}
     for key, value in request.META.items():
         if key.startswith('HTTP_'):
-            # Convert HTTP_CONTENT_TYPE to Content-Type
             header_name = key[5:].replace('_', '-').title()
+            # Authorization gets HMAC-hashed for consistent user tracking;
+            # all other sensitive headers are fully redacted
+            if key == 'HTTP_AUTHORIZATION':
+                headers[header_name] = hash_pii(value, secret_key) if secret_key else REDACTED
+                continue
+            if key in SENSITIVE_HEADERS:
+                headers[header_name] = REDACTED
+                continue
             headers[header_name] = value
         elif key in ('CONTENT_TYPE', 'CONTENT_LENGTH'):
-            # These don't have HTTP_ prefix but are still headers
             header_name = key.replace('_', '-').title()
             headers[header_name] = value
     return headers if headers else None
@@ -261,6 +296,8 @@ def _extract_headers(request):
 
 def _extract_query_params(request):
     """Extract query parameters from Django request.
+
+    Redacts values for sensitive parameter names.
 
     Args:
         request: Django HttpRequest object
@@ -273,21 +310,25 @@ def _extract_query_params(request):
 
     params = {}
     for key in request.GET:
-        values = request.GET.getlist(key)
-        params[key] = values[0] if len(values) == 1 else values
+        if key.lower() in SENSITIVE_KEYS:
+            params[key] = REDACTED
+        else:
+            values = request.GET.getlist(key)
+            params[key] = values[0] if len(values) == 1 else values
     return params
 
 
 def _extract_body(request):
     """Extract request body from Django request.
 
-    Only attempts to parse JSON bodies. Returns None for non-JSON content.
+    Only attempts to parse JSON bodies. Redacts sensitive keys.
+    Returns None for non-JSON content.
 
     Args:
         request: Django HttpRequest object
 
     Returns:
-        Parsed JSON body as dict, or None
+        Sanitized parsed JSON body as dict, or None
     """
     if request.method not in ('POST', 'PUT', 'PATCH'):
         return None
@@ -298,9 +339,22 @@ def _extract_body(request):
 
     try:
         if request.body:
-            return json.loads(request.body.decode('utf-8'))
+            body = json.loads(request.body.decode('utf-8'))
+            if isinstance(body, (dict, list)):
+                return sanitize_dict(body)
+            # Discard bare JSON primitives (strings, numbers) —
+            # they can't be meaningfully sanitized and may contain secrets
+            return None
     except (json.JSONDecodeError, UnicodeDecodeError):
         pass
+    except Exception as e:
+        # RawPostDataException is expected for streaming/chunked ASGI requests;
+        # anything else is unexpected and logged at WARNING for visibility
+        exc_name = type(e).__name__
+        if exc_name == 'RawPostDataException':
+            logger.debug(f"[Cerberus] Could not read request body: {exc_name}")
+        else:
+            logger.warning(f"[Cerberus] Unexpected error reading request body: {exc_name}: {e}")
 
     return None
 
@@ -319,10 +373,9 @@ class CerberusMiddleware:
     """
 
     def __init__(self, get_response):
-        global WS_CLIENT
-
         self.get_response = get_response
-        self.config = getattr(settings, 'CERBERUS_CONFIG', {})
+        self.config = dict(getattr(settings, 'CERBERUS_CONFIG', {}))
+        self._warned_no_secret_key = False
 
         if DEBUG_ENABLED:
             logger.info("[Cerberus] Middleware initializing...")
@@ -342,13 +395,23 @@ class CerberusMiddleware:
             else:
                 logger.warning("[Cerberus] Failed to fetch secret key. PII will not be hashed.")
 
-        # Initialize WebSocket client
-        if 'ws_url' in self.config and 'token' in self.config and 'client_id' in self.config:
-            WS_CLIENT = AsyncWebSocketClient(
-                self.config['ws_url'],
-                self.config['token'],
-                self.config['client_id']
+        # Warn if WebSocket URL is not using TLS
+        ws_url = self.config.get('ws_url', '')
+        if ws_url.startswith('ws://'):
+            logger.warning(
+                "[Cerberus] WebSocket URL uses unencrypted ws:// scheme. "
+                "Use wss:// in production to protect API keys and event data in transit."
             )
+
+        # Initialize WebSocket client (protected by lock for thread safety)
+        if 'ws_url' in self.config and 'token' in self.config and 'client_id' in self.config:
+            with _thread_lock:
+                global WS_CLIENT
+                WS_CLIENT = AsyncWebSocketClient(
+                    self.config['ws_url'],
+                    self.config['token'],
+                    self.config['client_id']
+                )
             if DEBUG_ENABLED:
                 logger.info(f"[Cerberus] WebSocket client initialized: {self.config['ws_url']}")
         else:
@@ -368,7 +431,7 @@ class CerberusMiddleware:
         request.cerberus_metrics = {}
 
         # Extract request data BEFORE processing (body can only be read once)
-        headers = _extract_headers(request)
+        headers = _extract_headers(request, self.config.get('secret_key'))
         query_params = _extract_query_params(request)
         body = _extract_body(request)
         user_agent = request.META.get('HTTP_USER_AGENT')
@@ -379,14 +442,24 @@ class CerberusMiddleware:
         # Extract user_id set by application (e.g., JWT auth decorators)
         user_id = getattr(request, 'cerberus_user_id', None)
 
-        # Extract metrics from response if they exist
+        # Extract metrics from response if they exist (sanitize to prevent leaks)
         metrics = {}
         if hasattr(response, 'data') and isinstance(response.data, dict):
             if '_cerberus_metrics' in response.data:
-                metrics = response.data.pop('_cerberus_metrics')
+                raw_metrics = response.data.pop('_cerberus_metrics')
+                metrics = sanitize_dict(raw_metrics) if isinstance(raw_metrics, dict) else {}
 
-        # Get source IP address
-        source_ip = request.META.get('REMOTE_ADDR')
+        # Get source IP address, normalize, and hash for PII protection
+        source_ip = normalize_ip(request.META.get('REMOTE_ADDR'))
+        secret_key = self.config.get('secret_key')
+        if secret_key and source_ip:
+            source_ip = hash_pii(source_ip, secret_key)
+        elif source_ip and not self._warned_no_secret_key:
+            self._warned_no_secret_key = True
+            logger.warning(
+                "[Cerberus] Sending source IP in plaintext — no secret_key configured. "
+                "Set secret_key in CERBERUS_CONFIG or configure backend_url to enable PII hashing."
+            )
 
         # Create the event data with current timestamp
         d = CoreData(

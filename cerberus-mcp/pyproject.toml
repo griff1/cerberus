@@ -1,0 +1,70 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "cerberus-mcp"
+version = "0.1.1"
+description = "MCP server instrumentation for Cerberus API monitoring"
+readme = "README.md"
+license = "MIT"
+authors = [
+    { name = "Griffin Potrock" }
+]
+keywords = [
+    "mcp",
+    "model-context-protocol",
+    "monitoring",
+    "analytics",
+    "instrumentation",
+    "websocket",
+    "async",
+    "ai",
+    "llm",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: System :: Monitoring",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+requires-python = ">=3.10"
+dependencies = [
+    "mcp>=1.0,<2.0",
+    "websockets>=12.0",
+    "cerberus-core>=0.1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-asyncio>=0.21",
+    "black>=23.0",
+    "ruff>=0.1",
+    "mypy>=1.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/gpotrock/cerberus"
+Documentation = "https://github.com/gpotrock/cerberus#mcp-server-monitoring"
+Repository = "https://github.com/gpotrock/cerberus.git"
+Issues = "https://github.com/gpotrock/cerberus/issues"
+
+[tool.hatch.build.targets.sdist]
+exclude = [
+    "/tests",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/cerberus_mcp"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
