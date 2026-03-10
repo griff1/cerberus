@@ -186,6 +186,10 @@ async def _process_queue_async():
         except thread_queue.Empty:
             continue
         except Exception as e:
+            # During interpreter shutdown, daemon threads get errors like
+            # "can't register atexit after shutdown" — exit silently
+            if "atexit" in str(e) or "shutdown" in str(e):
+                break
             logger.error(f"[CerberusMCP] Error getting from queue: {e}")
             continue
 

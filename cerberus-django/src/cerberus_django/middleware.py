@@ -173,6 +173,10 @@ async def _process_queue_async():
             # No events available, continue waiting
             continue
         except Exception as e:
+            # During interpreter shutdown, daemon threads get errors like
+            # "can't register atexit after shutdown" — exit silently
+            if "atexit" in str(e) or "shutdown" in str(e):
+                break
             logger.error(f"[Cerberus] Error getting from queue: {e}")
             continue
 
