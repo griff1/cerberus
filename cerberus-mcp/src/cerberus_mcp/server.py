@@ -9,6 +9,7 @@ and arguments, then sends events via WebSocket to the Cerberus pipeline.
 import asyncio
 import functools
 import logging
+import threading
 import time
 import uuid
 from datetime import datetime, timezone
@@ -173,6 +174,9 @@ class CerberusMCP(FastMCP):
         client_id = self._cerberus_config.get('client_id')
         ws_url = self._cerberus_config.get('ws_url')
 
+        self._schema_reported = False
+        self._schema_report_lock = threading.Lock()
+
         if token and client_id and ws_url:
             init_client(ws_url, token, client_id)
             if DEBUG_ENABLED:
@@ -264,6 +268,120 @@ class CerberusMCP(FastMCP):
 
         return all_args, context_info
 
+    def _report_schema(self):
+        """Emit a one-time schema_report event describing all registered tools, resources, and prompts.
+
+        Called lazily on the first real event so that all decorators have run
+        and the FastMCP internal registries are fully populated.
+        Thread-safe via _schema_report_lock.
+        """
+        with self._schema_report_lock:
+            if self._schema_reported:
+                return
+            self._schema_reported = True
+
+        token = self._cerberus_config.get('token', '')
+
+        tools_list = []
+        resources_list = []
+        prompts_list = []
+
+        try:
+            # Introspect registered tools
+            tool_manager = getattr(self, '_tool_manager', None)
+            if tool_manager is not None:
+                tools_dict = getattr(tool_manager, '_tools', {})
+                for t_name, t_obj in tools_dict.items():
+                    tool_entry = {"name": str(t_name)}
+                    tool_entry["description"] = getattr(t_obj, 'description', '') or ''
+                    # Tool.parameters is already a pre-computed JSON schema dict
+                    schema = getattr(t_obj, 'parameters', None)
+                    if isinstance(schema, dict) and schema:
+                        tool_entry["input_schema"] = schema
+                    tools_list.append(tool_entry)
+
+            # Introspect registered resources (both concrete and templates)
+            resource_manager = getattr(self, '_resource_manager', None)
+            if resource_manager is not None:
+                # Concrete resources with fixed URIs
+                resources_dict = getattr(resource_manager, '_resources', {})
+                for r_uri, r_obj in resources_dict.items():
+                    res_entry = {
+                        "uri_template": str(r_uri),
+                        "name": getattr(r_obj, 'name', str(r_uri)),
+                        "description": getattr(r_obj, 'description', '') or '',
+                    }
+                    resources_list.append(res_entry)
+
+                # Parameterized URI templates (e.g. "resource://{city}/weather")
+                templates_dict = getattr(resource_manager, '_templates', {})
+                for t_uri, t_obj in templates_dict.items():
+                    res_entry = {
+                        "uri_template": str(t_uri),
+                        "name": getattr(t_obj, 'name', str(t_uri)),
+                        "description": getattr(t_obj, 'description', '') or '',
+                    }
+                    resources_list.append(res_entry)
+
+            # Introspect registered prompts
+            prompt_manager = getattr(self, '_prompt_manager', None)
+            if prompt_manager is not None:
+                prompts_dict = getattr(prompt_manager, '_prompts', {})
+                for p_name, p_obj in prompts_dict.items():
+                    prompt_entry = {
+                        "name": str(p_name),
+                        "description": getattr(p_obj, 'description', '') or '',
+                    }
+                    # Extract declared arguments from the prompt's parameters
+                    p_args = getattr(p_obj, 'arguments', None)
+                    if p_args and isinstance(p_args, (list, tuple)):
+                        prompt_entry["arguments"] = [
+                            {
+                                "name": getattr(a, 'name', ''),
+                                "required": getattr(a, 'required', False),
+                                "description": getattr(a, 'description', ''),
+                            }
+                            for a in p_args
+                        ]
+                    prompts_list.append(prompt_entry)
+
+        except Exception as e:
+            logger.debug(f"[CerberusMCP] Schema introspection partial failure: {e}")
+
+        if not tools_list and not resources_list and not prompts_list:
+            logger.debug("[CerberusMCP] No schema to report (no registered tools/resources/prompts found)")
+            return
+
+        custom_data = {
+            'mcp_server': self._server_name,
+            'event_type': 'schema_report',
+            'tools': tools_list,
+            'resources': resources_list,
+            'prompts': prompts_list,
+        }
+
+        event = MCPEventData(
+            token=token,
+            source_ip="mcp-local",
+            endpoint=f"mcp://{self._server_name}/__schema__",
+            scheme="mcp",
+            method="mcp_schema_report",
+            timestamp=datetime.now(timezone.utc).isoformat(),
+            custom_data=custom_data,
+            headers=None,
+            query_params=None,
+            body=None,
+            user_agent=USER_AGENT,
+            user_id=None,
+        )
+
+        queue_event(event)
+        if DEBUG_ENABLED:
+            logger.info(
+                f"[CerberusMCP] Schema report sent: {len(tools_list)} tools, "
+                f"{len(resources_list)} resources, {len(prompts_list)} prompts"
+            )
+
     def _emit_event(
         self,
         handler_name: str,
@@ -287,6 +405,10 @@ class CerberusMCP(FastMCP):
             error: Error message string or None
             context_info: Dict with session_id, client_name, etc.
         """
+        # Emit schema report on first real event (lazy, after all decorators have run)
+        if not self._schema_reported:
+            self._report_schema()
+
         token = self._cerberus_config.get('token', '')
 
         custom_data = {
@@ -375,6 +497,7 @@ class CerberusMCP(FastMCP):
                         error=error_msg,
                         context_info=context_info,
                     )
+            async_wrapper.__wrapped__ = handler
             return async_wrapper
         else:
             @functools.wraps(handler)
@@ -403,6 +526,7 @@ class CerberusMCP(FastMCP):
                         error=error_msg,
                         context_info=context_info,
                     )
+            sync_wrapper.__wrapped__ = handler
             return sync_wrapper
 
     def tool(self, name=None, **kwargs):

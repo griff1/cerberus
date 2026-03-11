@@ -74,8 +74,17 @@ Drop-in replacement for `FastMCP` that instruments MCP tool/resource/prompt call
 - Wraps handlers to capture timing, arguments, errors, results
 - Extracts session/client identity from MCP Context objects
 - Same WebSocket transport pattern as cerberus-django
+- Schema reporting: on first event, introspects registered tools/resources/prompts via FastMCP internal registries (`_tool_manager`, `_resource_manager`, `_prompt_manager`) and emits a `mcp_schema_report` event with declared names, descriptions, `input_schema`, and prompt arguments
+- Thread-safe schema reporting with `threading.Lock` to prevent duplicate reports from concurrent handlers
+- Wrapper functions set `__wrapped__` attribute to preserve `inspect.signature()` chain for FastMCP parameter validation
 
 **Configuration:** `CerberusMCP("name", cerberus_config={"token": ..., "client_id": ..., "ws_url": ...})`
+
+**Key files:**
+- `server.py` — `CerberusMCP` class, `_wrap_handler()`, `_emit_event()`, `_report_schema()`
+- `structs.py` — `MCPEventData` dataclass
+- `transport.py` — WebSocket transport
+- `config.py` — Configuration handling
 
 ## Development
 
@@ -106,3 +115,21 @@ Set `CERBERUS_DEBUG=true` environment variable to enable verbose logging in both
 - MCP-specific metadata (arguments, duration, session info) goes in `custom_data`
 - Event queue is bounded (10,000 max for cerberus-mcp) to prevent unbounded memory growth
 - WebSocket transport is shared pattern but not shared code (each package has its own copy for independence)
+
+### MCP Event Methods
+
+| Method | Description | Tracked In |
+|--------|-------------|------------|
+| `mcp_tool_call` | Tool invocation | `mcp_tool_discovery` |
+| `mcp_resource_read` | Resource read | `mcp_resource_discovery` |
+| `mcp_prompt_get` | Prompt invocation | `mcp_prompt_discovery` |
+| `mcp_schema_report` | Schema introspection report (emitted once per server startup) | All three discovery tables (sets `description`, `input_schema`, `declared_arguments`, `schema_only=true`) |
+
+### Schema Report Flow
+
+1. `CerberusMCP._emit_event()` fires on the first actual tool/resource/prompt call
+2. Thread-safe check via `_schema_report_lock` ensures `_report_schema()` runs exactly once
+3. `_report_schema()` introspects FastMCP internals: `_tool_manager._tools`, `_resource_manager._resources`/`_templates`, `_prompt_manager._prompts`
+4. Emits a single `mcp_schema_report` event with `custom_data` containing `tools`, `resources`, `prompts` arrays
+5. `event_process` routes this to `MCPDiscoveryUpdater._handle_schema_report()` which creates `schema_only=True` records
+6. On subsequent real calls, UPSERT clears `schema_only` to `False` via `existing AND EXCLUDED`
